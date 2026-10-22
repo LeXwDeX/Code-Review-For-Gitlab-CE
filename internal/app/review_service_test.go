@@ -932,7 +932,13 @@ func TestCancelReviewDoesNotCancelNewerGeneration(t *testing.T) {
 	}
 	// The successor handler cancelled the old workflow; the invariant under
 	// test is that the newer one is untouched.
-	_ = oldWorkflow
+	oldSnapshot, err := f.engine.Snapshot(context.Background(), oldWorkflow)
+	if err != nil {
+		t.Fatalf("old Snapshot: %v", err)
+	}
+	if oldSnapshot.Status != dag.WorkflowCancelled {
+		t.Fatalf("old workflow status = %s, want cancelled", oldSnapshot.Status)
+	}
 }
 
 // dossierOverrideStore replaces the active workflow dossier so the cancel
@@ -1058,7 +1064,9 @@ func TestPublishEmptyRejectsControlChangeBeforePublish(t *testing.T) {
 	if f.gitlab.noteCount() != 0 {
 		t.Fatalf("stale empty summary was published (%d notes)", f.gitlab.noteCount())
 	}
-	_ = job
+	if jobGeneration(t, job) <= 0 {
+		t.Fatal("seed job has no generation")
+	}
 }
 
 func TestPublishEmptyRejectsIncompleteInputs(t *testing.T) {
