@@ -1,7 +1,8 @@
 # ARCH — GitLab CE 自动评审服务设计基线
 
-> 状态：**设计基线 v0.1（讨论稿）**，尚未开始编码。
+> 状态：**设计基线 v0.2（讨论稿）**，尚未开始编码。
 > 本文汇总了立项讨论中的全部结论。标注「已定」的条目是用户确认过的决策；标注「建议默认」的条目是讨论中提出、尚待确认的方案，见 §16 待决事项。
+> 实现层面的细化（接口签名、表结构、API、流程、配置）见 [docs/design/](docs/design/README.md)。
 
 ---
 
@@ -45,6 +46,8 @@
 | D15 | 采用项目工作区，允许模型生成 AGENTS.md / CLAUDE.md 等上下文文档；**生成内容只存平台内部，不提交到仓库** | 已定 |
 | D16 | 支持 MCP 接入（配置格式兼容 Claude Code），首个接入 codebase-memory-mcp 用于代码地图检索 | 已定 |
 | D17 | 支持 Skill 接入（格式兼容 Claude Code Skill） | 已定 |
+| D18 | Web 控制台：SPA（Vite + React + TypeScript）embed 进二进制；用 GitLab OAuth 登录，角色分 admin / viewer | 建议默认 |
+| D19 | DAG 节点分 agent 节点和代码节点（如 gather、adjudicate）两类，对引擎透明 | 建议默认 |
 
 ---
 
@@ -85,7 +88,11 @@ GitLab webhook / 评论命令 / 手动 API
 
 ```
 cmd/server/            入口
-internal/server/       HTTP、webhook handler、管理 API
+cmd/reviewctl/         管理 CLI（只调用 HTTP API）
+internal/server/       HTTP、webhook handler、管理 API、SSE、embed 前端
+internal/app/          服务层：MR 事件 → 工作流、项目注册、工作区编排、反馈收集
+internal/jobs/         持久化任务队列与 worker
+internal/secret/       AES-GCM 加解密
 internal/gitlab/       client-go 封装、webhook payload、diff 与 position 计算、发布器
 internal/repo/         bare mirror 缓存、worktree、安全的 git 参数
 internal/workspace/    项目工作区：base 检出、上下文文档、生命周期与读写锁
@@ -98,9 +105,10 @@ internal/store/        数据库访问与迁移（SQLite / Postgres）
 internal/config/       服务配置与仓库内配置解析
 pkg/dag/               DAG 引擎核心（场景无关，可被 agencoding 复用）
 prompts/               各 agent 的 prompt（embed 进二进制）
+web/                   Web 控制台（M6）
 ```
 
-`pkg/dag` 不依赖任何评审或 GitLab 概念，`internal/review` 在它之上定义评审专用的块和执行器。
+`pkg/dag` 不依赖任何评审或 GitLab 概念，`internal/review` 在它之上定义评审专用的块和执行器。文件级划分和各包接口见 [docs/design/01-modules.md](docs/design/01-modules.md)。
 
 ---
 
@@ -258,7 +266,7 @@ I4 的「逐条反驳」规则移植自 GraphAgent 的 accept 结算规则（裁
 
 ### 6.1 数据模型
 
-- **节点**：一次子 agent 调用。字段：`id`、`block`、`depends_on`、`required`、`prompt_template`、`input_mapping`（形如 `a.output.findings`）、`condition`、`output_schema`、`provider`、`timeout`。
+- **节点**：一次子 agent 调用，或一段纯代码逻辑（如 `gather` 汇聚去重、`adjudicate` 规则裁决）。两类对引擎透明，都实现同一个执行器接口。字段：`id`、`kind`、`depends_on`、`required`、`input_mapping`（形如 `a.output.findings`）、`condition`、`params`、`timeout`、`expands`。节点种类、图模板和契约见 [docs/design/04-dag-and-contracts.md](docs/design/04-dag-and-contracts.md)。
 - **块（Block）**：可复用的子图模板，由编译器展开成节点。共定义 6 种块（5 种用于 MR 评审，1 种用于工作区）：
 
 | 块 | 展开结果 |
@@ -441,6 +449,10 @@ data/workspaces/<project_id>/
 - onboarding 阶段用 `cli` 模式建索引，不必建立 MCP 会话。
 - 服务端部署时关闭 `auto_watch` / `watcher_enabled` 和 UI（默认端口 9749）。索引刷新由 Push Hook 驱动，UI 端口不对外暴露。
 - 索引只对 base 建。MR 改动的文件由 agent 在 worktree 中直接读取。prompt 中明确说明「图谱反映 base 版本，改动的文件以 worktree 为准」（借鉴 review agent 的 `check_index_coverage` 原则）。
+
+- **索引按路径识别项目**：codebase-memory 以「项目名 + 根路径」标识索引。因此 `base/` 的路径必须**按项目固定**（`data/workspaces/<project_id>/base`），刷新时在原目录内 fetch + checkout，**不重新 clone、不换目录**，索引就能一直复用并增量更新。MR 的 worktree 路径每次不同，不建索引。
+- **工作区主键用 GitLab `project_id`**：项目改名或转移 namespace 后 git 地址会变，但 `project_id` 不变；git 地址只作为属性记录，变化时更新 mirror 的 remote，不重建工作区。
+- **未来方向**：推动 codebase-memory 支持以仓库身份（规范化的 git remote 地址或 `project_id`）作为索引 key，与路径解耦，使同一仓库在不同路径（如多实例、迁移数据目录）下可直接复用索引。见 §16 Q18。
 
 待验证：
 
@@ -648,3 +660,5 @@ blocks:                     # 按块授权 MCP 工具、挂载 Skill
 | Q14 | 生成的上下文文档是否支持人工编辑与锁定？ | 支持，首版通过管理 API / CLI |
 | Q15 | 图谱索引只对 base 建，还是对 MR head 也做增量索引？ | 只对 base 建，改动的文件以 worktree 为准 |
 | Q16 | 是否读取仓库自带的 `.claude/skills`？ | 默认关闭，可按项目开启（只读目标分支版本） |
+| Q17 | Web 控制台的前端技术栈与登录方式（D18）？ | Vite + React + TypeScript；GitLab OAuth 登录 |
+| Q18 | 代码索引能否以仓库身份（git 地址或 project_id）为 key，而不是按路径？ | 首版靠固定工作区路径规避；后续向 codebase-memory 提需求或贡献实现 |
