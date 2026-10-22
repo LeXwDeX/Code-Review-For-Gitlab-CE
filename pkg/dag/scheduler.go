@@ -421,21 +421,31 @@ func (e *Engine) runNode(runCtx context.Context, handle *runHandle, wfID, nodeID
 	}
 	queueDeadline := queuedAt.Add(timeout)
 
-	waitCtx := runCtx
-	var waitCancel context.CancelFunc
-	if !queueDeadline.IsZero() {
-		waitCtx, waitCancel = context.WithDeadline(runCtx, queueDeadline)
-		defer waitCancel()
+	// Queue wait is measured with the engine clock, not wall time. Mixing
+	// context.WithDeadline (wall clock) with a custom engine clock makes a
+	// fixed test clock appear already expired.
+	var timeoutCh <-chan time.Time
+	if remaining := queueDeadline.Sub(e.clock()); remaining <= 0 {
+		if err := e.commitNodeFailure(runCtx, wfID, nodeID, view.Attempt, "queue_timeout", "queue wait exceeded node timeout"); err != nil {
+			handle.setErr(err)
+		}
+		return
+	} else {
+		timer := time.NewTimer(remaining)
+		defer timer.Stop()
+		timeoutCh = timer.C
 	}
 	select {
 	case e.sem <- struct{}{}:
-	case <-waitCtx.Done():
+	case <-timeoutCh:
 		if runCtx.Err() != nil {
 			return
 		}
 		if err := e.commitNodeFailure(runCtx, wfID, nodeID, view.Attempt, "queue_timeout", "queue wait exceeded node timeout"); err != nil {
 			handle.setErr(err)
 		}
+		return
+	case <-runCtx.Done():
 		return
 	}
 	released := false
