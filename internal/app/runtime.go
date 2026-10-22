@@ -95,6 +95,7 @@ type Runtime struct {
 	reviews     *ReviewService
 	workspaces  *WorkspaceService
 	feedback    *FeedbackService
+	retention   *RetentionService
 	publisher   *Publisher
 	worker      *ReviewWorker
 	lifecycle   *Lifecycle
@@ -310,6 +311,21 @@ func NewRuntime(ctx context.Context, cfg *config.Config, deps RuntimeDeps) (*Run
 		}
 		return nil, err
 	}
+	retention, err := NewRetentionService(RetentionConfig{
+		Store:             deps.Store,
+		LLMCallRetention:  cfg.Storage.LLMCallRetention,
+		DeliveryRetention: cfg.Storage.DeliveryRetention,
+		JobRetention:      cfg.Storage.JobRetention,
+		ContextVersions:   cfg.Storage.ContextVersions,
+		Logger:            logger,
+		Now:               now,
+	})
+	if err != nil {
+		if ownedMCP {
+			_ = mcpManager.Close()
+		}
+		return nil, err
+	}
 	worker, err := NewReviewWorker(reviews, workspaces)
 	if err != nil {
 		if ownedMCP {
@@ -376,6 +392,7 @@ func NewRuntime(ctx context.Context, cfg *config.Config, deps RuntimeDeps) (*Run
 		reviews:     reviews,
 		workspaces:  workspaces,
 		feedback:    feedback,
+		retention:   retention,
 		publisher:   publisher,
 		worker:      worker,
 		lifecycle:   &Lifecycle{},
@@ -455,6 +472,9 @@ func (r *Runtime) WorkspaceService() *WorkspaceService { return r.workspaces }
 // Feedback returns the feedback collector.
 func (r *Runtime) Feedback() *FeedbackService { return r.feedback }
 
+// Retention returns the periodic cleanup service.
+func (r *Runtime) Retention() *RetentionService { return r.retention }
+
 // Publisher exposes manual republish for the review API.
 func (r *Runtime) Publisher() *Publisher { return r.publisher }
 
@@ -487,15 +507,25 @@ func (r *Runtime) Recover(ctx context.Context) error {
 	return r.reviews.Recover(ctx)
 }
 
-// StartBackground starts the feedback ticker. The returned function stops it
-// and waits for the goroutine.
+// StartBackground starts the feedback and retention tickers. The returned
+// function stops them and waits for the goroutines.
 func (r *Runtime) StartBackground(ctx context.Context) func() {
 	r.startOnce.Do(func() {
 		bgCtx, cancel := context.WithCancel(ctx)
 		r.startStop = cancel
+		var wg sync.WaitGroup
+		wg.Add(2)
 		go func() {
-			defer close(r.startDone)
+			defer wg.Done()
 			r.feedback.Start(bgCtx, defaultFeedbackInterval)
+		}()
+		go func() {
+			defer wg.Done()
+			r.retention.Start(bgCtx, 0)
+		}()
+		go func() {
+			wg.Wait()
+			close(r.startDone)
 		}()
 	})
 	return func() {

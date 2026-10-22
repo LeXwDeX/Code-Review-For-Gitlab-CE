@@ -353,12 +353,12 @@ SQLite 必要的 PRAGMA：`journal_mode=WAL`、`busy_timeout=5000`、`foreign_ke
 
 ## 5. 保留与清理
 
-> 实现状态：以下策略是目标设计，当前**未实现定时清理**。`storage.llm_call_retention` 只有配置项和设置视图；`ClearLLMPayloads` 方法存在但没有调用方。项目注销时会删除该项目的 webhook 记录等数据，属于注销路径，不是保留策略。
+> 实现状态：定时清理已实现（`internal/app/retention_service.go`，默认每 6 小时）。`llm_calls` 超过保留期时删除整行，而不只是清空 payload；项目注销时的关联删除属于注销路径，不是保留策略。
 
-| 数据 | 默认保留 | 清理方式 |
-|---|---|---|
-| `llm_calls.request/response` | 30 天 | 定时任务把两列置空，保留用量统计 |
-| `webhook_deliveries` | 14 天 | 定时删除 |
-| `jobs`（done/cancelled） | 7 天 | 定时删除 |
-| `events`、`workflows`、`findings` | 长期 | 不清理；按需归档 |
-| `context_docs` | 每项目每种保留最近 5 个 base_sha + 所有 locked | 刷新时清理 |
+| 数据 | 默认保留 | 配置 | 清理方式 |
+|---|---|---|---|
+| `llm_calls` | 30 天 | `storage.llm_call_retention` | 定时删除整行 |
+| `webhook_deliveries` | 14 天 | `storage.delivery_retention` | 定时删除 |
+| `jobs`（done/failed/cancelled） | 7 天 | `storage.job_retention` | 定时删除；queued/running 永不删除 |
+| `events`、`workflows`、`findings` | 长期 | — | 不清理；按需归档 |
+| `context_docs` | 每项目每种保留最近 5 个未锁定版本 + 所有 locked | `storage.context_versions` | 定时按 `(project_id, kind)` 窗口清理 |

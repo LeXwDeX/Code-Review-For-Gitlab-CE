@@ -28,6 +28,42 @@ func TestValidateDefaultConfigWithoutProviders(t *testing.T) {
 	}
 }
 
+func TestValidateStorageRetention(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "llm call retention",
+			body: "storage:\n  llm_call_retention: 0s\n",
+			want: "storage.llm_call_retention",
+		},
+		{
+			name: "delivery retention",
+			body: "storage:\n  delivery_retention: -1h\n",
+			want: "storage.delivery_retention",
+		},
+		{
+			name: "job retention",
+			body: "storage:\n  job_retention: 0s\n",
+			want: "storage.job_retention",
+		},
+		{
+			name: "context versions",
+			body: "storage:\n  context_versions: 0\n",
+			want: "storage.context_versions",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setRequiredEnv(t)
+			cfg := loadConfig(t, writeConfig(t, "config.yaml", validGitLab+tt.body))
+			requireErrorContains(t, cfg.Validate(), tt.want, "must be positive")
+		})
+	}
+}
+
 func TestValidateAggregatesErrorsWithoutLeakingValues(t *testing.T) {
 	const (
 		providerEnv = "CFG_TEST_PROVIDER_KEY"

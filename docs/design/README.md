@@ -19,7 +19,7 @@
 以下是当前代码与目标设计已知不一致的地方。文档正文保留目标契约，不因实现偏差删除。
 
 - [01-modules.md](01-modules.md)：文件清单是设计目标。发布器实际在 `internal/app/publisher.go`；GitLab 发布与评论命令处理在 `internal/app` 层；`pkg/dag/validate.go` 的校验合并进 `pkg/dag/graph.go`。
-- [02-data-model.md](02-data-model.md)：保留/清理策略未实现定时任务；`sessions` 表存在但运行时未使用，会话在内存中，重启后用户需重新登录。
+- [02-data-model.md](02-data-model.md)：`sessions` 表存在但运行时未使用，会话在内存中，重启后用户需重新登录；保留期定时清理已实现。
 - [03-http-api.md](03-http-api.md)：项目详情暂不返回工作区状态和最近评审；评审详情暂不返回 `mr_title` 和 `publications.commit_status`；`GET /projects` 已支持 `q` / `enabled` 但不分页；上下文文档保存就地更新当前版本；Skill zip 上传已实现并受限；MCP/Skill/绑定列表不分页；SSE 每 2 秒轮询。
 - [04-dag-and-contracts.md](04-dag-and-contracts.md)：I4 使用 `decision.finding_id` + `reason`；token 预算耗尽会使未完成节点失败/跳过，而不是降级为「不再核验」；extend 契约增加 `new_finding_index`。
 - [06-config.md](06-config.md)：仓库级 `profile` / `skip_draft` / `labels_exclude` 只在评审执行阶段部分合并，webhook 过滤早于仓库配置合并；示例配置缺 `providers` 和 `propose`，不能直接跑真实评审。
