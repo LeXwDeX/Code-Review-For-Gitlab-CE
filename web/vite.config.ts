@@ -16,5 +16,17 @@ export default defineConfig({
     globals: true,
     setupFiles: './tests/setup.ts',
     css: true,
+    coverage: {
+      provider: 'v8',
+      reporter: ['text', 'lcov'],
+      include: ['src/**/*.{ts,tsx}'],
+      exclude: ['src/main.tsx', 'src/api/types.ts'],
+      thresholds: {
+        statements: 38,
+        branches: 62,
+        functions: 38,
+        lines: 38,
+      },
+    },
   },
 })
