@@ -114,7 +114,7 @@ go mod verify
 
 - SSE 通过每 2 秒轮询数据库产生事件，不是推送。
 - 数据库中的平台/项目 MCP、Skill 和绑定变更按进程内缓存生效，通常需要重启服务。
-- 数据保留策略未实现：`storage.llm_call_retention` 只出现在配置和设置视图中，没有定时清理任务。
+- 数据保留清理已实现（`internal/app/retention_service.go`，默认每 6 小时）：`llm_calls`、`webhook_deliveries`、终态 `jobs` 按配置保留期删除，`context_docs` 按 `storage.context_versions` 保留未锁定版本；活动版本与锁定版本不删除。
 - 手动保存上下文文档会就地更新当前 `(project, base_sha, kind)` 行，不新增历史版本。
 - 项目列表支持 `q` / `enabled` 筛选，但不分页；MCP、Skill、块绑定列表也不分页。
 - Postgres 未实现，配置 `storage.driver: postgres` 会在启动时报错。

@@ -305,6 +305,49 @@ func TestPruneContextDocsKeepsActiveVersion(t *testing.T) {
 	}
 }
 
+func TestPruneContextDocsProtectsActiveLockedAndSharedBase(t *testing.T) {
+	ctx := context.Background()
+	clock := newFakeClock()
+	s := openTestStore(t, clock)
+	mustProject(t, s, 1)
+	now := clock.Now()
+	insert := func(id, base, kind string, locked bool, at time.Time) {
+		t.Helper()
+		if _, err := s.db.Exec(`INSERT INTO context_docs
+			(id, project_id, base_sha, kind, source, content, locked, created_at)
+			VALUES (?, 1, ?, ?, 'generated', 'content', ?, ?)`,
+			id, base, kind, boolInt(locked), formatTime(at)); err != nil {
+			t.Fatalf("insert context doc %s: %v", id, err)
+		}
+	}
+	// Active base is shared by both kinds and one row is also locked.
+	insert("agents-old", "shared", "agents", false, now.Add(-10*time.Hour))
+	insert("claude-old", "shared", "claude", false, now.Add(-9*time.Hour))
+	insert("agents-locked", "locked-base", "agents", true, now.Add(-8*time.Hour))
+	for i := 1; i <= 5; i++ {
+		insert(fmt.Sprintf("agents-%d", i), fmt.Sprintf("a-%d", i), "agents", false, now.Add(time.Duration(i-7)*time.Hour))
+	}
+	if _, err := s.db.Exec(`UPDATE workspaces SET context_sha = 'shared' WHERE project_id = 1`); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := s.PruneContextDocs(ctx, 3); err != nil {
+		t.Fatalf("PruneContextDocs: %v", err)
+	} else if n != 2 {
+		t.Fatalf("pruned = %d, want 2", n)
+	}
+	for _, id := range []string{"agents-old", "claude-old", "agents-locked", "agents-3", "agents-4", "agents-5"} {
+		if got := rowCount(t, s, `SELECT COUNT(*) FROM context_docs WHERE id = ?`, id); got != 1 {
+			t.Errorf("%s was deleted", id)
+		}
+	}
+	if got := rowCount(t, s, `SELECT COUNT(*) FROM context_docs WHERE id IN ('agents-1','agents-2')`); got != 0 {
+		t.Errorf("old unlocked rows were not pruned")
+	}
+	if n, err := s.PruneContextDocs(ctx, 3); err != nil || n != 0 {
+		t.Fatalf("second prune = %d, %v; want 0", n, err)
+	}
+}
+
 func TestPruneContextDocsBatchesAllPrunableRows(t *testing.T) {
 	ctx := context.Background()
 	clock := newFakeClock()
