@@ -508,12 +508,17 @@ func (s *ReviewService) CancelReview(ctx context.Context, job *jobs.Job) error {
 		dossier, err := s.store.GetWorkflowDossier(ctx, active.ID)
 		if err != nil {
 			if errors.Is(err, store.ErrNotFound) {
-				return nil
+				// A workflow without its dossier cannot be validated or
+				// repaired by a retry, so settle the job instead of looping.
+				return PermanentJob(fmt.Errorf("%w: workflow %s", store.ErrIncompleteWorkflow, active.ID))
 			}
 			return err
 		}
 		if dossier.Generation > payload.Generation {
-			return nil
+			// A newer review already owns the MR. Never cancel it, but report
+			// the superseded result instead of silently succeeding.
+			return PermanentJob(fmt.Errorf("%w: workflow %s generation %d is newer than cancel generation %d",
+				ErrReviewSuperseded, active.ID, dossier.Generation, payload.Generation))
 		}
 	}
 	control, err = s.store.GetReviewControl(ctx, payload.ProjectID, payload.MRIID)
@@ -1192,6 +1197,9 @@ func (s *ReviewService) prepareRun(ctx context.Context, project *store.Project, 
 
 // publishEmpty publishes the "nothing to review" summary without a workflow.
 func (s *ReviewService) publishEmpty(ctx context.Context, project *store.Project, token string, control *store.ReviewControl, inputs *reviewInputs, cfg effectiveReviewConfig) error {
+	if inputs == nil || inputs.MR == nil || inputs.Version == nil {
+		return PermanentJob(errors.New("app: publish empty summary: incomplete review inputs"))
+	}
 	if s.publisher == nil {
 		return errors.New("app: review publisher is not configured")
 	}
@@ -1221,6 +1229,10 @@ func (s *ReviewService) publishEmpty(ctx context.Context, project *store.Project
 	if err := recheck(); err != nil {
 		return err
 	}
+	// A push can still land between this recheck and the summary upsert below.
+	// That window is accepted: the summary marker keys the publication, so a
+	// late write is replaced by the next review instead of creating a second
+	// summary.
 	return s.publisher.PublishStandaloneSummary(ctx, project.ID, control.MRIID, token, fingerprint, body)
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -100,6 +101,31 @@ func TestReviewRunSupersededBeforeCreation(t *testing.T) {
 	}
 	if f.gitlab.noteCount() != 0 {
 		t.Fatalf("superseded job published %d notes", f.gitlab.noteCount())
+	}
+}
+
+// incompleteWorkflowStore reports the store sentinel for a workflow row that
+// has no dossier. The real window needs a crash between the workflow insert and
+// the dossier write, so it cannot be replayed deterministically.
+type incompleteWorkflowStore struct {
+	*sqlite.Store
+}
+
+func (s *incompleteWorkflowStore) CreateReviewWorkflow(context.Context, sqlite.ReviewWorkflowRequest) (string, bool, error) {
+	return "", false, fmt.Errorf("%w: workflow wf-incomplete", store.ErrIncompleteWorkflow)
+}
+
+func TestRunReviewIncompleteWorkflowIsPermanent(t *testing.T) {
+	f := newReviewFixture(t, reviewTestHead)
+	job := f.seedReview(t, "job-run-incomplete")
+	f.service.store = &incompleteWorkflowStore{Store: f.db}
+
+	err := f.service.RunReview(context.Background(), job)
+	if !IsPermanentJob(err) {
+		t.Fatalf("RunReview error = %v, want a permanent error", err)
+	}
+	if !errors.Is(err, store.ErrIncompleteWorkflow) {
+		t.Fatalf("RunReview error = %v, want store.ErrIncompleteWorkflow", err)
 	}
 }
 
@@ -693,6 +719,34 @@ func TestReviewCancelSettlesWorkflow(t *testing.T) {
 	_ = job
 }
 
+// TestCancelReviewSettlesSameGeneration covers the normal cancel acceptance
+// criterion: the cancel command bumps the generation while keeping the head,
+// and the pending workflow of the previous generation is cancelled.
+func TestCancelReviewSettlesSameGeneration(t *testing.T) {
+	f := newReviewFixture(t, reviewTestHead)
+	runJob := f.seedReview(t, "job-cancel-same-gen-run")
+	generation := jobGeneration(t, runJob)
+	wfID := createPendingReview(t, f, runJob.ID, generation)
+	cancelJob := f.seedCancel(t, "job-cancel-same-gen")
+	if got := jobGeneration(t, cancelJob); got != generation+1 {
+		t.Fatalf("cancel generation = %d, want %d", got, generation+1)
+	}
+
+	if err := f.service.CancelReview(context.Background(), cancelJob); err != nil {
+		t.Fatalf("CancelReview: %v", err)
+	}
+	workflow, err := f.db.GetWorkflow(context.Background(), wfID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if workflow.Status != string(dag.WorkflowCancelled) {
+		t.Fatalf("workflow status = %q, want cancelled", workflow.Status)
+	}
+	if _, err := f.db.FindActiveReview(context.Background(), 42, 7); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("active review remains after cancel: %v", err)
+	}
+}
+
 func TestReviewRecoverRunsPendingAndPublishes(t *testing.T) {
 	f := newReviewFixture(t, reviewTestHead)
 	job := f.seedReview(t, "job-run-5")
@@ -862,8 +916,9 @@ func TestCancelReviewDoesNotCancelNewerGeneration(t *testing.T) {
 	}
 	f.service.store = race
 
-	if err := f.service.CancelReview(context.Background(), cancelJob); err != nil {
-		t.Fatalf("CancelReview: %v", err)
+	err := f.service.CancelReview(context.Background(), cancelJob)
+	if !IsPermanentJob(err) || !errors.Is(err, ErrReviewSuperseded) {
+		t.Fatalf("CancelReview error = %v, want a permanent ErrReviewSuperseded", err)
 	}
 	if newerWorkflow == "" {
 		t.Fatal("successor workflow was not created")
@@ -875,9 +930,77 @@ func TestCancelReviewDoesNotCancelNewerGeneration(t *testing.T) {
 	if snapshot.Status == dag.WorkflowCancelled {
 		t.Fatalf("newer generation workflow was cancelled")
 	}
-	// The old workflow belongs to this cancel generation and may be cancelled;
-	// the invariant under test is that the newer one is untouched.
+	// The successor handler cancelled the old workflow; the invariant under
+	// test is that the newer one is untouched.
 	_ = oldWorkflow
+}
+
+// dossierOverrideStore replaces the active workflow dossier so the cancel
+// generation checks can be exercised without reproducing a store crash.
+type dossierOverrideStore struct {
+	*sqlite.Store
+	dossier *store.WorkflowDossier
+	err     error
+}
+
+func (s *dossierOverrideStore) GetWorkflowDossier(ctx context.Context, workflowID string) (*store.WorkflowDossier, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	dossier := *s.dossier
+	dossier.WorkflowID = workflowID
+	return &dossier, nil
+}
+
+func TestCancelReviewDossierMissingIsPermanent(t *testing.T) {
+	f := newReviewFixture(t, reviewTestHead)
+	runJob := f.seedReview(t, "job-cancel-no-dossier-run")
+	wfID := createPendingReview(t, f, runJob.ID, jobGeneration(t, runJob))
+	cancelJob := f.seedCancel(t, "job-cancel-no-dossier")
+	f.service.store = &dossierOverrideStore{Store: f.db, err: store.ErrNotFound}
+
+	err := f.service.CancelReview(context.Background(), cancelJob)
+	if !IsPermanentJob(err) {
+		t.Fatalf("CancelReview error = %v, want a permanent error", err)
+	}
+	if !errors.Is(err, store.ErrIncompleteWorkflow) {
+		t.Fatalf("CancelReview error = %v, want store.ErrIncompleteWorkflow", err)
+	}
+	if !strings.Contains(err.Error(), wfID) {
+		t.Fatalf("CancelReview error = %v, want workflow id %s", err, wfID)
+	}
+	workflow, err := f.db.GetWorkflow(context.Background(), wfID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if workflow.Status != string(dag.WorkflowPending) {
+		t.Fatalf("workflow status = %q, want pending", workflow.Status)
+	}
+}
+
+func TestCancelReviewNewerDossierIsSuperseded(t *testing.T) {
+	f := newReviewFixture(t, reviewTestHead)
+	runJob := f.seedReview(t, "job-cancel-newer-dossier-run")
+	wfID := createPendingReview(t, f, runJob.ID, jobGeneration(t, runJob))
+	cancelJob := f.seedCancel(t, "job-cancel-newer-dossier")
+	f.service.store = &dossierOverrideStore{Store: f.db, dossier: &store.WorkflowDossier{
+		Generation: jobGeneration(t, cancelJob) + 1,
+	}}
+
+	err := f.service.CancelReview(context.Background(), cancelJob)
+	if !IsPermanentJob(err) {
+		t.Fatalf("CancelReview error = %v, want a permanent error", err)
+	}
+	if !errors.Is(err, ErrReviewSuperseded) {
+		t.Fatalf("CancelReview error = %v, want ErrReviewSuperseded", err)
+	}
+	workflow, err := f.db.GetWorkflow(context.Background(), wfID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if workflow.Status == string(dag.WorkflowCancelled) {
+		t.Fatalf("newer dossier workflow was cancelled")
+	}
 }
 
 // publishRaceStore advances the review generation before the second control
@@ -936,6 +1059,42 @@ func TestPublishEmptyRejectsControlChangeBeforePublish(t *testing.T) {
 		t.Fatalf("stale empty summary was published (%d notes)", f.gitlab.noteCount())
 	}
 	_ = job
+}
+
+func TestPublishEmptyRejectsIncompleteInputs(t *testing.T) {
+	f := newReviewFixture(t, reviewTestHead)
+	f.seedReview(t, "job-empty-inputs")
+	control, err := f.db.GetReviewControl(context.Background(), 42, 7)
+	if err != nil {
+		t.Fatalf("GetReviewControl: %v", err)
+	}
+	project, err := f.db.GetProject(context.Background(), 42)
+	if err != nil {
+		t.Fatalf("GetProject: %v", err)
+	}
+	cases := []struct {
+		name   string
+		inputs *reviewInputs
+	}{
+		{name: "nil inputs", inputs: nil},
+		{name: "missing merge request", inputs: &reviewInputs{
+			Version: &gitlab.Version{HeadSHA: f.head},
+		}},
+		{name: "missing version", inputs: &reviewInputs{
+			MR: &gitlab.MergeRequest{IID: 7, State: "opened", SHA: f.head},
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := f.service.publishEmpty(context.Background(), project, "token", control, tc.inputs, effectiveReviewConfig{Settings: f.defaults})
+			if !IsPermanentJob(err) {
+				t.Fatalf("publishEmpty error = %v, want a permanent error", err)
+			}
+			if f.gitlab.noteCount() != 0 {
+				t.Fatalf("incomplete inputs published %d notes", f.gitlab.noteCount())
+			}
+		})
+	}
 }
 
 var _ = dag.WorkflowCancelled
