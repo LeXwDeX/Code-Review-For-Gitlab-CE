@@ -361,4 +361,4 @@ SQLite 必要的 PRAGMA：`journal_mode=WAL`、`busy_timeout=5000`、`foreign_ke
 | `webhook_deliveries` | 14 天 | `storage.delivery_retention` | 定时删除 |
 | `jobs`（done/failed/cancelled） | 7 天 | `storage.job_retention` | 定时删除；queued/running 永不删除 |
 | `events`、`workflows`、`findings` | 长期 | — | 不清理；按需归档 |
-| `context_docs` | 每项目每种保留最近 5 个未锁定版本 + 所有 locked | `storage.context_versions` | 定时按 `(project_id, kind)` 窗口清理 |
+| `context_docs` | 每项目每种保留最近 5 个未锁定版本 + 所有 locked；当前生效版本（`workspaces.context_sha`）永不删除 | `storage.context_versions` | 定时按 `(project_id, kind)` 窗口清理，每批最多 500 行 |

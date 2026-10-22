@@ -97,29 +97,46 @@ func (s *Store) DeleteTerminalJobsBefore(ctx context.Context, before time.Time) 
 }
 
 // PruneContextDocs keeps the newest keep unlocked context versions for each
-// (project_id, kind) pair and deletes older unlocked versions. Locked rows are
-// never deleted and do not consume a retained slot.
+// (project_id, kind) pair and deletes older unlocked versions in bounded
+// batches. Locked rows are never deleted and do not consume a retained slot.
+// The project's active version (workspaces.context_sha) is never deleted,
+// whatever its kind.
 func (s *Store) PruneContextDocs(ctx context.Context, keep int) (int64, error) {
 	if keep <= 0 {
 		return 0, errors.New("sqlite: context versions to keep must be positive")
 	}
-	res, err := s.db.ExecContext(ctx, `DELETE FROM context_docs
-		WHERE locked = 0 AND id IN (
-			SELECT id FROM (
-				SELECT id, ROW_NUMBER() OVER (
-					PARTITION BY project_id, kind
-					ORDER BY created_at DESC, id DESC
-				) AS rn
-				FROM context_docs
-				WHERE locked = 0
-			) WHERE rn > ?
-		)`, keep)
-	if err != nil {
-		return 0, fmt.Errorf("sqlite: prune context documents: %w", err)
+	var total int64
+	for {
+		res, err := s.db.ExecContext(ctx, `DELETE FROM context_docs
+			WHERE locked = 0 AND id IN (
+				SELECT id FROM (
+					SELECT id, project_id, base_sha, ROW_NUMBER() OVER (
+						PARTITION BY project_id, kind
+						ORDER BY created_at DESC, id DESC
+					) AS rn
+					FROM context_docs
+					WHERE locked = 0
+				) AS ranked
+				WHERE ranked.rn > ?
+					AND NOT EXISTS (
+						SELECT 1 FROM workspaces w
+						WHERE w.project_id = ranked.project_id
+							AND w.context_sha = ranked.base_sha
+							AND w.context_sha <> ''
+					)
+				ORDER BY ranked.rn DESC, ranked.id
+				LIMIT ?
+			)`, keep, retentionBatch)
+		if err != nil {
+			return total, fmt.Errorf("sqlite: prune context documents: %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return total, fmt.Errorf("sqlite: prune context documents: %w", err)
+		}
+		total += n
+		if n < retentionBatch {
+			return total, nil
+		}
 	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return 0, fmt.Errorf("sqlite: prune context documents: %w", err)
-	}
-	return n, nil
 }

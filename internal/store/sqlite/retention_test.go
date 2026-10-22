@@ -239,3 +239,110 @@ func TestPruneContextDocsKeepsNewestUnlockedAndLocked(t *testing.T) {
 		t.Fatalf("second PruneContextDocs = %d, %v; want 0", n, err)
 	}
 }
+
+func TestPruneContextDocsKeepsActiveVersion(t *testing.T) {
+	ctx := context.Background()
+	clock := newFakeClock()
+	s := openTestStore(t, clock)
+	mustProject(t, s, 1)
+	now := clock.Now()
+
+	insert := func(id string, locked bool, at time.Time) {
+		t.Helper()
+		if _, err := s.db.Exec(`INSERT INTO context_docs
+			(id, project_id, base_sha, kind, source, content, locked, created_at)
+			VALUES (?, 1, ?, 'agents', 'generated', 'content', ?, ?)`,
+			id, id, boolInt(locked), formatTime(at)); err != nil {
+			t.Fatalf("insert context doc %s: %v", id, err)
+		}
+	}
+	insert("agents-v0-locked", true, now.Add(-8*time.Hour))
+	for i := 1; i <= 7; i++ {
+		insert(fmt.Sprintf("agents-v%d", i), false, now.Add(time.Duration(i-8)*time.Hour))
+	}
+	if _, err := s.db.Exec(`UPDATE workspaces SET context_sha = 'agents-v1' WHERE project_id = 1`); err != nil {
+		t.Fatalf("set active context: %v", err)
+	}
+
+	// v1 is outside the newest five but active, so only v2 is prunable.
+	if n, err := s.PruneContextDocs(ctx, 5); err != nil || n != 1 {
+		t.Fatalf("PruneContextDocs = %d, %v; want 1", n, err)
+	}
+	if got := rowCount(t, s, `SELECT COUNT(*) FROM context_docs WHERE id = 'agents-v1'`); got != 1 {
+		t.Errorf("active context version was deleted")
+	}
+	if got := rowCount(t, s, `SELECT COUNT(*) FROM context_docs WHERE id = 'agents-v0-locked' AND locked = 1`); got != 1 {
+		t.Errorf("locked context document was deleted")
+	}
+	if got := rowCount(t, s, `SELECT COUNT(*) FROM context_docs WHERE id = 'agents-v2'`); got != 0 {
+		t.Errorf("agents-v2 was not pruned")
+	}
+	for i := 3; i <= 7; i++ {
+		if got := rowCount(t, s, `SELECT COUNT(*) FROM context_docs WHERE id = ?`, fmt.Sprintf("agents-v%d", i)); got != 1 {
+			t.Errorf("agents-v%d was deleted", i)
+		}
+	}
+	if got := rowCount(t, s, `SELECT COUNT(*) FROM context_docs`); got != 7 {
+		t.Errorf("context_docs = %d, want 7", got)
+	}
+
+	if n, err := s.PruneContextDocs(ctx, 5); err != nil || n != 0 {
+		t.Fatalf("second PruneContextDocs = %d, %v; want 0", n, err)
+	}
+
+	// Without an active version the old row is prunable again.
+	if _, err := s.db.Exec(`UPDATE workspaces SET context_sha = NULL WHERE project_id = 1`); err != nil {
+		t.Fatalf("clear active context: %v", err)
+	}
+	if n, err := s.PruneContextDocs(ctx, 5); err != nil || n != 1 {
+		t.Fatalf("PruneContextDocs after clearing active = %d, %v; want 1", n, err)
+	}
+	if got := rowCount(t, s, `SELECT COUNT(*) FROM context_docs WHERE id = 'agents-v1'`); got != 0 {
+		t.Errorf("inactive old version was not pruned")
+	}
+	if got := rowCount(t, s, `SELECT COUNT(*) FROM context_docs WHERE id = 'agents-v0-locked'`); got != 1 {
+		t.Errorf("locked context document was deleted")
+	}
+}
+
+func TestPruneContextDocsBatchesAllPrunableRows(t *testing.T) {
+	ctx := context.Background()
+	clock := newFakeClock()
+	s := openTestStore(t, clock)
+	mustProject(t, s, 1)
+	const rows = retentionBatch + 5
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	stmt, err := tx.PrepareContext(ctx, `INSERT INTO context_docs
+		(id, project_id, base_sha, kind, source, content, locked, created_at)
+		VALUES (?, 1, ?, 'agents', 'generated', 'content', 0, ?)`)
+	if err != nil {
+		t.Fatalf("prepare context docs: %v", err)
+	}
+	base := clock.Now().Add(-time.Duration(rows) * time.Hour)
+	for i := 0; i < rows; i++ {
+		id := fmt.Sprintf("ctx-%04d", i)
+		if _, err := stmt.ExecContext(ctx, id, id, formatTime(base.Add(time.Duration(i)*time.Hour))); err != nil {
+			t.Fatalf("insert context doc %d: %v", i, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	if n, err := s.PruneContextDocs(ctx, 1); err != nil || n != rows-1 {
+		t.Fatalf("PruneContextDocs = %d, %v; want %d", n, err, rows-1)
+	}
+	if got := rowCount(t, s, `SELECT COUNT(*) FROM context_docs`); got != 1 {
+		t.Errorf("context_docs remaining = %d, want 1", got)
+	}
+	if got := rowCount(t, s, `SELECT COUNT(*) FROM context_docs WHERE id = 'ctx-0504'`); got != 1 {
+		t.Errorf("newest context version was not kept")
+	}
+	if n, err := s.PruneContextDocs(ctx, 1); err != nil || n != 0 {
+		t.Errorf("second PruneContextDocs = %d, %v; want 0", n, err)
+	}
+}
