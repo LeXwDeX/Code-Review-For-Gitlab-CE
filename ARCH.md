@@ -1,6 +1,6 @@
 # ARCH — GitLab CE 自动评审服务设计基线
 
-> 状态：**设计基线 v0.2（讨论稿）**，尚未开始编码。
+> 状态：**设计基线 v0.2（讨论稿）**。M0–M6 的本地实现已完成，实际能力、未验证项与限制见 [README.md](README.md)。尚未与真实 GitLab CE、模型 provider 或 OAuth 联调。
 > 本文汇总了立项讨论中的全部结论。标注「已定」的条目是用户确认过的决策；标注「建议默认」的条目是讨论中提出、尚待确认的方案，见 §16 待决事项。
 > 实现层面的细化（接口签名、表结构、API、流程、配置）见 [docs/design/](docs/design/README.md)。
 
@@ -13,7 +13,7 @@
 - 通过**项目级 Token** 授权，既能被 GitLab webhook 回调触发，也能主动触发评审，并把结果回写到 MR。
 - 服务拥有 clone 项目代码的权限，评审时不只看 diff，也能读取完整仓库上下文。
 - 评审由一个**主 agent 单入口**统一编排：主 agent 派发多种评审模式，经过跨模型或同模型的**对抗性核验**后，回到主 agent 评估，最终输出结论到 MR。
-- 编排层以 **DAG 引擎**为唯一执行架构，从作者本人的 OpenCode-GraphAgent DAG 引擎移植而来（见 §13）。
+- 编排层以 **DAG 引擎**为唯一执行架构。当前 `pkg/dag` 按本设计独立实现；是否移植 OpenCode-GraphAgent 的上游引擎及授权仍未确认（见 §13）。
 - 每个项目有一个常驻**工作区**：模型可以预先生成 AGENTS.md / CLAUDE.md 等项目上下文，并通过 **MCP 和 Skill** 接入外部能力（如 codebase-memory-mcp 的代码地图检索）。这些内容只在平台内部使用（见 §8）。
 
 ### 非目标
@@ -38,7 +38,7 @@
 | D7 | 评审模式：`reasoner`、`review`、`verify`、`code-review`（传统） | 已定 |
 | D8 | 支持跨模型和同模型的对抗性审核 | 已定 |
 | D9 | 主 agent 单入口 → 多模式评审 → 回到主 agent 评估 → 输出结论到 MR | 已定 |
-| D10 | 复用 OpenCode-GraphAgent 的 DAG 引擎；作者为版权人，可将其改为 MIT 后移植 | 已定 |
+| D10 | 参考 OpenCode-GraphAgent 的 DAG 引擎；是否移植上游代码及 MIT 授权仍待确认。当前 `pkg/dag` 为独立实现 | 待确认 |
 | D11 | `verify` 在 MR 场景下定位为**挑战者**：对单条 finding 做只读反证，不跑测试 | 建议默认 |
 | D12 | 驱动方式：规划 → 执行 → 汇总，允许有限轮补派（extend），不用自由工具循环 | 建议默认 |
 | D13 | 部署形态：单个二进制，默认 SQLite、可选 Postgres，提供 Docker 镜像，任务队列在进程内 | 建议默认 |
@@ -251,18 +251,18 @@ type Finding struct {
 | I1 | 每个节点的输出必须通过 `output_schema` 校验。缺失时补问 1 次，仍失败则节点 `failed` |
 | I2 | finding 的行号必须落在 diff 的行集合内，否则去掉行号，降级进汇总 |
 | I3 | REFUTED 必须引用代码位置作为证据，否则按 UNCERTAIN 处理 |
-| I4 | 子节点已 CONFIRMED 的 P0/P1，synthesize 要丢弃或降级，必须给出 `{node, index, reason}` 形式的逐条反驳，否则结算失败 |
+| I4 | 子节点已 CONFIRMED 的 P0/P1，synthesize 要丢弃或降级，必须给出逐条反驳及理由，否则结算失败；当前实现用 `decision.finding_id` + `reason`（见 docs/design/04） |
 | I5 | synthesize 自提的 finding 标记为 `origin=main`，同样要经过 verify 反证 |
 | I6 | 最终结论一致性：存在已确认的 P0/P1 时，不得给出 PASS |
 | I7 | 结论绑定 fingerprint（见 §6.5）。发布前 fingerprint 不一致，结果作废 |
 
-I4 的「逐条反驳」规则移植自 GraphAgent 的 accept 结算规则（裁决为 ACCEPT 时不得自带 required_actions；每条 required_actions 必须逐条反驳）。
+I4 的「逐条反驳」规则参考 GraphAgent 的 accept 结算规则（裁决为 ACCEPT 时不得自带 required_actions；每条 required_actions 必须逐条反驳）；当前没有复制上游代码。
 
 ---
 
 ## 6. DAG 引擎（`pkg/dag`）
 
-从 OpenCode-GraphAgent 的 `packages/core/src/dag/` 和 `packages/opencode/src/dag/` 移植（TS → Go，参照原代码逐模块重写）。只保留场景无关的部分，IDE 交互相关的部分裁掉。
+当前 `pkg/dag` 是依据本设计独立实现的 Go 代码，没有复制 GraphAgent 的 TypeScript 源码。实现只覆盖场景无关的 DAG 能力，IDE 交互相关部分不包含。如未来改为移植上游代码，需先完成 §13 的授权确认。
 
 ### 6.1 数据模型
 
@@ -283,7 +283,7 @@ I4 的「逐条反驳」规则移植自 GraphAgent 的 accept 结算规则（裁
 
 ### 6.2 状态机
 
-两条铁律（移植自原引擎）：**状态只能通过校验过的迁移改变；终态不可逆。**
+两条铁律（借鉴原引擎的设计）：**状态只能通过校验过的迁移改变；终态不可逆。**
 
 节点状态（去掉原引擎中用于交互暂停的 `paused`）：
 
@@ -596,12 +596,14 @@ blocks:                     # 按块授权 MCP 工具、挂载 Skill
 - 发布物中附带 `THIRD_PARTY_LICENSES`，构建时用 `go-licenses` 自动收集。
 - 外部 MCP 服务器（如 codebase-memory-mcp）以独立进程运行，不链接进本项目，其许可证不影响本项目；若打包进 Docker 镜像分发，需遵守其自身许可证。
 - CI 许可证检查：允许 MIT、BSD、Apache-2.0、ISC、MPL-2.0（不修改）；**禁止 GPL、AGPL**。
-- **DAG 引擎来源**：`pkg/dag` 移植自 OpenCode-GraphAgent 的 DAG 引擎（原为 AGPL-3.0-or-later，Copyright (c) 2026 LeXwDeX）。版权人同意以 MIT 授权移植到本项目，需在 `NOTICE` 中写明。注意：
+- **DAG 引擎来源**：`pkg/dag` 当前是依据本设计独立实现的 Go 代码，**不是**从 OpenCode-GraphAgent 移植的产物；没有复制上游代码，也没有添加 `NOTICE`。若未来选择移植，需先确认上游署名与授权（原仓库标注 AGPL-3.0-or-later，Copyright (c) 2026 LeXwDeX），并保留相应版权声明。以下事项仅适用于未来的移植评估：
   - 原 DAG 代码引用的上游 opencode 模块是 MIT（Copyright (c) 2025 opencode），若一并移植，需保留其版权声明。
   - 原块合约改编自 mattpocock/skills（MIT），若移植相关 prompt，需保留出处。
   - 移植前需确认原仓库中署名为 `Test <test@opencode.test>` 的两个提交（含引擎首个提交 `c8e7b676fd`）出自版权人本人。
 
-### 13.1 移植清单
+### 13.1 未来移植参考清单（当前未执行）
+
+下表只是未来如选择移植时的参考，不代表当前实现。
 
 | 原模块 | 处理 |
 |---|---|
@@ -632,7 +634,7 @@ blocks:                     # 按块授权 MCP 工具、挂载 Skill
 |---|---|
 | M0 骨架 | 服务配置、项目注册、webhook 接收与校验、任务队列、SQLite |
 | M1 单模式闭环 | 采集阶段、`code-review` 单节点、一个 provider、汇总评论与行内讨论发布、行号校验、幂等 |
-| M2 DAG 引擎 | 移植 `pkg/dag`（状态机、图校验、调度、事件与投影）、取消与 fingerprint、三个 LLM adapter |
+| M2 DAG 引擎 | 实现 `pkg/dag`（状态机、图校验、调度、事件与投影；当前为独立实现，见 §13）、取消与 fingerprint、三个 LLM adapter |
 | M3 主 agent 编排 | plan / fan_out / synthesize、`review` 与 `reasoner` 块、只读工具循环、裁决不变量 I1–I7 |
 | M4 对抗核验 | `verify` 挑战者、拓扑 A 和 B、跨模型选择、去重、UNCERTAIN 策略、commit status |
 | M5 工作区与扩展 | 项目工作区与生命周期、Push Hook、onboarding 工作流与上下文文档、MCP 接入（首个为 codebase-memory-mcp）、Skill 接入 |

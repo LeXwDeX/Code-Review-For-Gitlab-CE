@@ -1,0 +1,99 @@
+:root {
+  color-scheme: light;
+  --font-sans: "Noto Sans SC", "Source Han Sans SC", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  --bg: #f4f5f7;
+  --surface: #ffffff;
+  --surface-2: #f6f7f9;
+  --surface-3: #eef0f3;
+  --nav: #14171c;
+  --nav-hover: #1f242c;
+  --nav-active: #272c36;
+  --nav-text: #c9ced6;
+  --nav-muted: #9aa3af;
+  --nav-border: #2a2f38;
+  --text: #15181d;
+  --muted: #5b6470;
+  --muted-strong: #3f4752;
+  --border: #e3e6ea;
+  --border-strong: #c3cad3;
+  --control-border: #b9c1cb;
+  --accent: #2457d6;
+  --accent-hover: #1e4ab8;
+  --accent-soft: #e8eefc;
+  --accent-ring: #2457d6;
+  --link: #1f4fc4;
+  --on-accent: #ffffff;
+
+  --ok-bg: #e6f4ec;
+  --ok-fg: #1d6b43;
+  --warn-bg: #fdf0e3;
+  --warn-fg: #8a3d05;
+  --danger-bg: #fce9e7;
+  --danger-fg: #a8251a;
+  --danger-solid: #a8251a;
+  --danger-solid-hover: #8e1d14;
+  --info-bg: #e8eefc;
+  --info-fg: #1e4ab8;
+  --neutral-bg: #eef0f3;
+  --neutral-fg: #3f4752;
+
+  --code-bg: #14171c;
+  --code-fg: #e6e9ee;
+  --preview-bg: #f8f9fb;
+
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 14px;
+  --control-h: 44px;
+  --page-max: 1180px;
+  --shadow-modal: 0 18px 44px rgba(17, 24, 39, 0.22), 0 2px 8px rgba(17, 24, 39, 0.08);
+  --overlay: rgba(13, 16, 20, 0.52);
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #101318;
+  --surface: #171b21;
+  --surface-2: #1d222a;
+  --surface-3: #242a33;
+  --nav: #0d1014;
+  --nav-hover: #181d24;
+  --nav-active: #242a33;
+  --nav-text: #d4d9e0;
+  --nav-muted: #aab3bf;
+  --nav-border: #2a3039;
+  --text: #e6e9ee;
+  --muted: #a7b0bc;
+  --muted-strong: #c2cad4;
+  --border: #2a3039;
+  --border-strong: #3e4753;
+  --control-border: #4a5562;
+  --accent: #2f62e0;
+  --accent-hover: #3f72f0;
+  --accent-soft: #1f2c47;
+  --accent-ring: #8fb2ff;
+  --link: #8fb2ff;
+  --on-accent: #ffffff;
+
+  --ok-bg: #15301f;
+  --ok-fg: #8fd8af;
+  --warn-bg: #33230f;
+  --warn-fg: #f2c07a;
+  --danger-bg: #3a1c1a;
+  --danger-fg: #f3a39a;
+  --danger-solid: #b23a32;
+  --danger-solid-hover: #c24d44;
+  --info-bg: #1b2942;
+  --info-fg: #a8c2ff;
+  --neutral-bg: #252b33;
+  --neutral-fg: #c4ccd6;
+
+  --code-bg: #0b0e12;
+  --code-fg: #dfe5ec;
+  --preview-bg: #12161b;
+
+  --shadow-modal: 0 22px 54px rgba(0, 0, 0, 0.55), 0 2px 10px rgba(0, 0, 0, 0.4);
+  --overlay: rgba(0, 0, 0, 0.64);
+}

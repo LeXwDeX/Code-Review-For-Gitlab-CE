@@ -1,0 +1,361 @@
+// Package server implements the HTTP surface: health checks, GitLab webhook
+// ingress, authenticated project administration, OAuth sessions, and the
+// embedded web console.
+package server
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"io/fs"
+	"log/slog"
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/LeXwDeX/Code-Review-For-Gitlab-CE/internal/app"
+	"github.com/LeXwDeX/Code-Review-For-Gitlab-CE/internal/config"
+	"github.com/LeXwDeX/Code-Review-For-Gitlab-CE/internal/store"
+)
+
+const (
+	webhookBodyLimit = 5 << 20
+	adminBodyLimit   = 1 << 20
+	webhookTimeout   = 900 * time.Millisecond
+	pingTimeout      = time.Second
+)
+
+// AdminService is the project registration and lifecycle surface.
+type AdminService interface {
+	Register(ctx context.Context, in app.RegisterInput) (*app.Registration, error)
+	List(ctx context.Context) ([]store.Project, error)
+	ListFiltered(ctx context.Context, filter app.ProjectListFilter) ([]store.Project, error)
+	Get(ctx context.Context, id int64) (*store.Project, error)
+	Update(ctx context.Context, id int64, in app.UpdateProjectInput) (*store.Project, error)
+	RotateToken(ctx context.Context, id int64, token string) (*store.Project, error)
+	CreateWebhook(ctx context.Context, id int64) (*app.WebhookRegistration, error)
+	Delete(ctx context.Context, id int64) error
+}
+
+// WebhookAcceptor accepts one authenticated delivery.
+type WebhookAcceptor interface {
+	Handle(ctx context.Context, req app.WebhookRequest) (app.WebhookResult, error)
+}
+
+// Pinger checks database availability for readiness.
+type Pinger interface {
+	Ping(ctx context.Context) error
+}
+
+// WorkerState reports whether the job worker is running.
+type WorkerState interface {
+	Ready() bool
+}
+
+// Config configures the HTTP server. M0 fields are required; the M6 admin
+// dependencies are optional and their routes answer 503 when unwired.
+type Config struct {
+	AdminToken string
+	Projects   AdminService
+	Webhooks   WebhookAcceptor
+	Database   Pinger
+	Worker     WorkerState
+	Auth       AuthConfig
+	Logger     *slog.Logger
+
+	Store      Store
+	Reviews    ReviewController
+	Workspace  WorkspaceService
+	Extensions ExtensionService
+	MCP        MCPTester
+	LLM        ProviderTester
+	Tokens     TokenStore
+	Platform   *config.Config
+	StreamPoll time.Duration
+	Now        func() time.Time
+}
+
+// Server routes all HTTP requests.
+type Server struct {
+	adminToken string
+	projects   AdminService
+	webhooks   WebhookAcceptor
+	database   Pinger
+	worker     WorkerState
+	auth       *authService
+	sessions   *sessionStore
+	web        fs.FS
+	logger     *slog.Logger
+	handler    http.Handler
+
+	store      Store
+	reviews    ReviewController
+	workspace  WorkspaceService
+	extensions ExtensionService
+	mcp        MCPTester
+	llm        ProviderTester
+	tokens     TokenStore
+	platform   *config.Config
+	streamPoll time.Duration
+	now        func() time.Time
+}
+
+// New validates dependencies and builds the routing tree.
+func New(cfg Config) (*Server, error) {
+	if cfg.Projects == nil || cfg.Webhooks == nil {
+		return nil, errors.New("server: project and webhook services are required")
+	}
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	auth, err := newAuthService(cfg.Auth)
+	if err != nil {
+		return nil, err
+	}
+	web, err := newWebFS()
+	if err != nil {
+		return nil, err
+	}
+	s := &Server{
+		adminToken: cfg.AdminToken,
+		projects:   cfg.Projects,
+		webhooks:   cfg.Webhooks,
+		database:   cfg.Database,
+		worker:     cfg.Worker,
+		auth:       auth,
+		sessions:   newSessionStore(sessionLimit, auth.now),
+		web:        web,
+		logger:     logger,
+		store:      cfg.Store,
+		reviews:    cfg.Reviews,
+		workspace:  cfg.Workspace,
+		extensions: cfg.Extensions,
+		mcp:        cfg.MCP,
+		llm:        cfg.LLM,
+		tokens:     cfg.Tokens,
+		platform:   cfg.Platform,
+		streamPoll: cfg.StreamPoll,
+		now:        cfg.Now,
+	}
+	if s.now == nil {
+		s.now = time.Now
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", s.handleHealth)
+	mux.HandleFunc("GET /readyz", s.handleReady)
+	mux.HandleFunc("POST /webhooks/gitlab", s.handleWebhook)
+	mux.HandleFunc("GET /auth/login", s.handleLogin)
+	mux.HandleFunc("GET /auth/callback", s.handleCallback)
+	mux.HandleFunc("POST /auth/logout", s.handleLogout)
+	mux.HandleFunc("GET /api/v1/me", s.apiAuth(s.handleMe))
+	mux.HandleFunc("POST /api/v1/projects", s.apiAuth(s.handleRegisterProject))
+	mux.HandleFunc("GET /api/v1/projects", s.apiAuth(s.handleListProjects))
+	mux.HandleFunc("GET /api/v1/projects/{id}", s.apiAuth(s.handleGetProject))
+	mux.HandleFunc("PATCH /api/v1/projects/{id}", s.apiAuth(s.handleUpdateProject))
+	mux.HandleFunc("PUT /api/v1/projects/{id}/token", s.apiAuth(s.handleRotateProjectToken))
+	mux.HandleFunc("POST /api/v1/projects/{id}/webhook", s.apiAuth(s.handleCreateProjectWebhook))
+	mux.HandleFunc("DELETE /api/v1/projects/{id}", s.apiAuth(s.handleDeleteProject))
+	// Reviews (workflows).
+	mux.HandleFunc("GET /api/v1/reviews", s.apiAuth(s.handleListReviews))
+	mux.HandleFunc("POST /api/v1/projects/{id}/merge_requests/{iid}/reviews", s.apiAuth(s.handleTriggerReview))
+	mux.HandleFunc("GET /api/v1/reviews/{wf_id}", s.apiAuth(s.handleGetReview))
+	mux.HandleFunc("GET /api/v1/reviews/{wf_id}/graph", s.apiAuth(s.handleReviewGraph))
+	mux.HandleFunc("GET /api/v1/reviews/{wf_id}/findings", s.apiAuth(s.handleReviewFindings))
+	mux.HandleFunc("GET /api/v1/reviews/{wf_id}/nodes/{node_id}", s.apiAuth(s.handleReviewNode))
+	mux.HandleFunc("GET /api/v1/reviews/{wf_id}/nodes/{node_id}/calls", s.apiAuth(s.handleNodeCalls))
+	mux.HandleFunc("GET /api/v1/reviews/{wf_id}/stream", s.apiAuth(s.handleReviewStream))
+	mux.HandleFunc("POST /api/v1/reviews/{wf_id}/cancel", s.apiAuth(s.handleCancelReview))
+	mux.HandleFunc("POST /api/v1/reviews/{wf_id}/republish", s.apiAuth(s.handleRepublishReview))
+	// Workspace and context documents.
+	mux.HandleFunc("GET /api/v1/projects/{id}/workspace", s.apiAuth(s.handleGetWorkspace))
+	mux.HandleFunc("POST /api/v1/projects/{id}/workspace/refresh", s.apiAuth(s.handleRefreshWorkspace))
+	mux.HandleFunc("GET /api/v1/projects/{id}/context-docs", s.apiAuth(s.handleListContextDocs))
+	mux.HandleFunc("GET /api/v1/projects/{id}/context-docs/current", s.apiAuth(s.handleGetCurrentContextDoc))
+	mux.HandleFunc("PUT /api/v1/projects/{id}/context-docs/current", s.apiAuth(s.handleSaveCurrentContextDoc))
+	mux.HandleFunc("POST /api/v1/projects/{id}/context-docs/current/lock", s.apiAuth(s.handleLockContextDoc))
+	// Extensions: MCP servers, skills, block bindings.
+	mux.HandleFunc("GET /api/v1/mcp-servers", s.apiAuth(s.handleListMCPServers))
+	mux.HandleFunc("POST /api/v1/mcp-servers", s.apiAuth(s.handleCreateMCPServer))
+	mux.HandleFunc("POST /api/v1/mcp-servers/import", s.apiAuth(s.handleImportMCPServers))
+	mux.HandleFunc("PUT /api/v1/mcp-servers/{id}", s.apiAuth(s.handleUpdateMCPServer))
+	mux.HandleFunc("DELETE /api/v1/mcp-servers/{id}", s.apiAuth(s.handleDeleteMCPServer))
+	mux.HandleFunc("POST /api/v1/mcp-servers/{id}/test", s.apiAuth(s.handleTestMCPServer))
+	mux.HandleFunc("GET /api/v1/skills", s.apiAuth(s.handleListSkills))
+	mux.HandleFunc("POST /api/v1/skills", s.apiAuth(s.handleUploadSkillOrRegisterDirectory))
+	mux.HandleFunc("DELETE /api/v1/skills/{id}", s.apiAuth(s.handleDeleteSkill))
+	mux.HandleFunc("GET /api/v1/block-bindings", s.apiAuth(s.handleListBlockBindings))
+	mux.HandleFunc("PUT /api/v1/block-bindings/{block}", s.apiAuth(s.handleUpsertBlockBinding))
+	// System.
+	mux.HandleFunc("GET /api/v1/providers", s.apiAuth(s.handleListProviders))
+	mux.HandleFunc("POST /api/v1/providers/{name}/test", s.apiAuth(s.handleTestProvider))
+	mux.HandleFunc("GET /api/v1/profiles", s.apiAuth(s.handleListProfiles))
+	mux.HandleFunc("GET /api/v1/stats", s.apiAuth(s.handleStats))
+	mux.HandleFunc("GET /api/v1/settings", s.apiAuth(s.handleSettings))
+	// API tokens (browser sessions only).
+	mux.HandleFunc("GET /api/v1/api-tokens", s.apiAuth(s.handleListAPITokens))
+	mux.HandleFunc("POST /api/v1/api-tokens", s.apiAuth(s.handleCreateAPIToken))
+	mux.HandleFunc("DELETE /api/v1/api-tokens/{id}", s.apiAuth(s.handleDeleteAPIToken))
+	mux.HandleFunc("/api/", s.apiAuth(s.handleAPINotFound))
+	mux.HandleFunc("/api/v1", s.apiAuth(s.handleAPINotFound))
+	mux.HandleFunc("/", s.handleWeb)
+
+	s.handler = s.requestID(s.logRequests(s.recoverPanic(mux)))
+	return s, nil
+}
+
+// Handler returns the composed HTTP handler.
+func (s *Server) Handler() http.Handler {
+	return s.handler
+}
+
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.handler.ServeHTTP(w, r)
+}
+
+type contextKey int
+
+const requestIDKey contextKey = iota
+
+func requestID(ctx context.Context) string {
+	value, _ := ctx.Value(requestIDKey).(string)
+	return value
+}
+
+func (s *Server) requestID(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id, err := uuid.NewV7()
+		requestID := ""
+		if err == nil {
+			requestID = id.String()
+		} else {
+			requestID = uuid.NewString()
+		}
+		w.Header().Set("X-Request-ID", requestID)
+		ctx := context.WithValue(r.Context(), requestIDKey, requestID)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+	bytes  int
+}
+
+func (w *statusWriter) WriteHeader(status int) {
+	if w.status != 0 {
+		return
+	}
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *statusWriter) Write(p []byte) (int, error) {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	n, err := w.ResponseWriter.Write(p)
+	w.bytes += n
+	return n, err
+}
+
+// Unwrap lets http.ResponseController reach the underlying writer (for
+// example to set a webhook body read deadline).
+func (w *statusWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
+func (s *Server) logRequests(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		recorder := &statusWriter{ResponseWriter: w}
+		next.ServeHTTP(recorder, r)
+		status := recorder.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		level := slog.LevelInfo
+		if status >= 500 {
+			level = slog.LevelWarn
+		}
+		s.logger.Log(r.Context(), level, "http request",
+			"request_id", requestID(r.Context()),
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", status,
+			"bytes", recorder.bytes,
+			"duration_ms", time.Since(start).Milliseconds(),
+		)
+	})
+}
+
+func (s *Server) recoverPanic(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if recover() == nil {
+				return
+			}
+			if responseStarted(w) {
+				// The panic value can contain request data; do not log it.
+				s.logger.Warn("panic after response started", "request_id", requestID(r.Context()), "path", r.URL.Path)
+				return
+			}
+			// The panic value can contain request data; do not log it.
+			s.logger.Warn("panic recovered", "request_id", requestID(r.Context()), "path", r.URL.Path)
+			if r.URL.Path == "/webhooks/gitlab" {
+				writeWebhookResponse(w, r, map[string]any{"ignored": "internal_error"})
+				return
+			}
+			writeError(w, r, http.StatusInternalServerError, "internal", "internal error", nil)
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+
+func responseStarted(w http.ResponseWriter) bool {
+	if recorder, ok := w.(*statusWriter); ok {
+		return recorder.status != 0
+	}
+	return false
+}
+
+func (s *Server) authorized(r *http.Request) bool {
+	if s.adminToken == "" {
+		return false
+	}
+	value := bearerValue(r)
+	if value == "" {
+		return false
+	}
+	return constantTimeEqualStrings(s.adminToken, value)
+}
+
+func decodeJSON(w http.ResponseWriter, r *http.Request, limit int64, target any) error {
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(target); err != nil {
+		return err
+	}
+	var extra any
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("server: multiple JSON values")
+		}
+		return err
+	}
+	return nil
+}
+
+func parseID(raw string) (int64, error) {
+	id, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || id <= 0 {
+		return 0, errors.New("server: invalid id")
+	}
+	return id, nil
+}

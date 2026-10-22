@@ -151,11 +151,13 @@ runNode(n):
   out, err := executor.Execute(ctx, input(n))
   if 当前 attempt != attempt 或工作流已终态: 丢弃结果; return
   if err:  emit node.failed  (ctx 被工作流取消时 emit node.aborted)
-  else:    emit node.completed(out)
-           if n.Expands:
-               nodes := expander.Expand(...)
-               validate(nodes, budget)       # 失败则本节点视为 failed
-               emit workflow.extended(nodes)
+  else:
+    if n.Expands:
+      extension := expander.Expand(...)
+      validate(extension, budget)             # 失败则写 node.failed，不先写 completed
+      append(node.completed(out), workflow.extended(extension)) # 同一事务
+    else:
+      emit node.completed(out)
 ```
 
 所有 `emit` 都走 `EventStore.Append(expectRev)`；遇到 `ErrStaleRevision` 时重新读取快照后再判断是否还需要写。
@@ -181,8 +183,10 @@ runNode(n):
 每次 `Create` / `Extend` 前检查：
 
 - 节点总数 ≤ `budget.max_nodes`（默认 30）。
-- extend 次数 ≤ `budget.max_extends`（默认 1）。
-- 累计 token 超过 `budget.max_tokens` 时：不再展开 verify（`gather` 只输出不挑战的结果），并在汇总里注明「预算不足，部分条目未经核验」。
+- 显式补派（`source=extend`）次数 ≤ `budget.max_extends`（默认 1）；plan 和 gather 的正常 `fan_out` 不消耗此额度。
+- 累计 token 超过 `budget.max_tokens` 时（设计意图）：不再展开 verify（`gather` 只输出不挑战的结果），并在汇总里注明「预算不足，部分条目未经核验」。
+
+> 实现偏差：当前 `pkg/dag` 在预算耗尽时会终止未完成的节点：required 节点写 `failed(budget_exhausted)`，可选节点写 `skipped(budget_exhausted)`。它不会降级为「不展开 verify、继续发布未核验结果」。
 
 ---
 
@@ -308,10 +312,11 @@ type Decision struct {
 	Reason    string   `json:"reason"`
 }
 type ExtendRequest struct {
-	Kind      string   `json:"kind"`       // verify | review
-	FindingID string   `json:"finding_id,omitempty"`
-	Files     []string `json:"files,omitempty"`
-	Focus     string   `json:"focus"`
+	Kind            string   `json:"kind"`       // verify | review
+	FindingID       string   `json:"finding_id,omitempty"`
+	NewFindingIndex *int     `json:"new_finding_index,omitempty"` // verify 新 finding 时使用，与 finding_id 二选一
+	Files           []string `json:"files,omitempty"`
+	Focus           string   `json:"focus"`
 }
 
 // onboarding
@@ -329,6 +334,8 @@ type Module struct {
 	Purpose string `json:"purpose"`
 }
 ```
+
+> 实现偏差：`new_finding_index` 是当前实现新增的字段，用于对 `new_findings` 中尚未成为已有组的条目发起 verify；`verify` 必须且只能给出 `finding_id` 或 `new_finding_index` 之一。
 
 ### 6.3 严重级别归一化
 
@@ -377,9 +384,11 @@ for g in groups:
 | 不变量 | 检查 |
 |---|---|
 | I4 | 规则建议 `publish` 且已 CONFIRMED 的 P0/P1，若 decision 为 `drop` / `downgrade`，`reason` 不能为空，且长度 ≥ 20 字符 |
-| I5 | `new_findings` 非空时，必须伴随对应的 `extend_requests{kind: verify}`；否则这些新条目一律 `mark` |
+| I5 | `new_findings` 非空时，必须通过对应的 verify 节点后才能进入发布决策；缺少挑战请求或没有补派预算时拒绝提交，重提仍失败则保留规则裁决，并明确说明新条目未核验且未发布。不得用 `mark` 绕过核验 |
 | I6 | 存在最终 `publish` 的 P0/P1 时，`verdict` 必须是 `BLOCKING` |
 | — | `decisions` 必须覆盖所有 `judge` 状态的组 |
+
+> 实现偏差：I4 的逐条反驳通过 `decisions[].finding_id` 映射回组，并校验 `reason`，不使用 `{node, index, reason}` 作为 synthesize 的输出结构；`{node, index}` 仍用于 `review.gate` 的来源引用。
 
 校验失败：把错误回给模型重提一次；再失败则退回规则裁决结果，并在汇总里注明。
 

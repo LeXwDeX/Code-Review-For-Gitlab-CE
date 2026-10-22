@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Code Review CE</title>
+    <script>
+      try {
+        var saved = localStorage.getItem('crc-theme');
+        var dark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+        document.documentElement.dataset.theme = saved === 'dark' || saved === 'light' ? saved : (dark ? 'dark' : 'light');
+      } catch (_) {}
+    </script>
+    <script type="module" crossorigin src="/assets/index-jT4XmSNX.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-DHjGrOgz.css">
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>

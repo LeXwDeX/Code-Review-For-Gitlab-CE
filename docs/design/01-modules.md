@@ -29,6 +29,11 @@ internal/review ──→ internal/agent ──→ internal/llm
 
 ## 2. 目录与文件
 
+> 实现偏差：本节文件清单是设计目标，当前实现有几处不同：
+> - 评审发布器在 `internal/app/publisher.go`，不在 `internal/gitlab/publish.go`。
+> - GitLab 发布和评论命令处理在 `internal/app` 层（`publisher.go`、`webhook_service.go`、`command_worker.go`），不在 `internal/gitlab/publish.go` / `command.go`。
+> - `pkg/dag/validate.go` 未单独存在，图校验合并在 `pkg/dag/graph.go`。
+
 ```
 cmd/
   server/main.go                 读配置 → 建依赖 → 启动 HTTP、job worker、恢复未完成工作流
@@ -199,10 +204,22 @@ type NodeExecutor interface {
 	Execute(ctx context.Context, in NodeInput) (NodeOutput, error)
 }
 
-// Expander 在 Expands=true 的节点完成后被调用，返回要追加的节点。
-// 用于 fan_out（plan → 并行评审）和动态挑战（gather → verify.*）。
+// Expander 在 Expands=true 的节点提交终态前调用。
+// 扩展校验成功后，与 node.completed 在同一次 Append 中原子持久化。
+type DepPatch struct {
+	Node string   `json:"node"`
+	Add  []string `json:"add"`
+}
+
+type Extension struct {
+	Nodes      []NodeSpec `json:"nodes"`
+	DepPatches []DepPatch `json:"dep_patches,omitempty"`
+	Source     string    `json:"source"` // fan_out | extend；仅 extend 消耗 MaxExtends
+	FromNode   string    `json:"from_node"`
+}
+
 type Expander interface {
-	Expand(ctx context.Context, wf WorkflowView, from NodeSpec, out json.RawMessage) ([]NodeSpec, error)
+	Expand(ctx context.Context, wf WorkflowView, from NodeSpec, out json.RawMessage) (Extension, error)
 }
 
 type EventStore interface {
@@ -551,24 +568,31 @@ package jobs
 type Job struct {
 	ID       string
 	Kind     string          // review.run | review.cancel | workspace.onboard | workspace.refresh | feedback.collect
-	Key      string          // 去重键；同 key 有活动任务时 Enqueue 返回已有 ID
+	Key      string          // 去重键；同 key 有排队任务时 Enqueue 返回已有 ID
 	Payload  json.RawMessage
 	RunAfter time.Time
+	Attempts int             // 领取时递增，用于拒绝旧执行结果
+	LeaseOwner string
 }
 
 type Queue interface {
 	Enqueue(ctx context.Context, j Job) (id string, dup bool, err error)
 	Claim(ctx context.Context, worker string, kinds []string, lease time.Duration) (*Job, error)
-	Heartbeat(ctx context.Context, id, worker string, lease time.Duration) error
-	Complete(ctx context.Context, id string) error
-	Fail(ctx context.Context, id string, err error, retryAt *time.Time) error
-	CancelByKey(ctx context.Context, keyPrefix string) (int, error)
+	Heartbeat(ctx context.Context, j Job, lease time.Duration) error
+	Complete(ctx context.Context, j Job) error
+	Fail(ctx context.Context, j Job, cause error, retryAt *time.Time) error
+	CancelByKey(ctx context.Context, key string) (int, error)
+	Recover(ctx context.Context) (int, error)
 }
 
 type Handler func(ctx context.Context, j *Job) error
 ```
 
 job 和 DAG 的分工：job 是**粗粒度、持久化的入口**（webhook → job），保证事件不丢；job handler 负责创建并驱动一个 DAG 工作流。DAG 自己负责节点级的状态和恢复。
+
+M0 中 `Job` 是 `store.Job` 的别名，完整持久化字段见实现。结算和续租校验 `LeaseOwner`、`Attempts` 及租约有效期。`CancelByKey` 只取消精确 key 的 queued 任务，不做前缀匹配。同 key 允许一个 running 和一个 queued 后继，后继在前者结束后才能领取。worker 只领取已注册处理器的种类；当前评审与工作区任务均已注册处理器。
+
+`store.EnqueueLatest` 供已授权的评审命令使用：与 webhook 入队一样，原子替换同 key、同 kind 的 queued 内容，保留 running 内容。替换时保留单调递增的 attempt，并把 `max_attempts` 设置为当前 attempt 加上新 payload 的重试预算；旧 worker 不会因编号重用而结算新任务。
 
 ---
 
@@ -602,7 +626,7 @@ func BuildGraph(p Profile, d *Dossier) (dag.GraphSpec, error)
 type Executor struct{ /* llm.Registry、tools、prompts、store … */ }
 
 func (e *Executor) Execute(ctx context.Context, in dag.NodeInput) (dag.NodeOutput, error) // 按 Kind 分派
-func (e *Executor) Expand(ctx context.Context, wf dag.WorkflowView, from dag.NodeSpec, out json.RawMessage) ([]dag.NodeSpec, error)
+func (e *Executor) Expand(ctx context.Context, wf dag.WorkflowView, from dag.NodeSpec, out json.RawMessage) (dag.Extension, error)
 
 // Publish 在工作流完成后由 app 层调用；内部先做 fingerprint 校验。
 func Publish(ctx context.Context, deps PublishDeps, wfID string) (*PublishReport, error)

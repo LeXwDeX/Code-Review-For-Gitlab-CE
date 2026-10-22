@@ -1,0 +1,53 @@
+{
+  "exchanges": [
+    {
+      "status": 200,
+      "headers": { "Content-Type": "application/json" },
+      "body": {
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-test",
+        "content": [
+          { "type": "thinking", "thinking": "we should read", "signature": "sig_abc" },
+          { "type": "redacted_thinking", "data": "redacted_data" },
+          { "type": "text", "text": "checking" },
+          { "type": "tool_use", "id": "toolu_1", "name": "read_file", "input": { "path": "README.md" } }
+        ],
+        "stop_reason": "tool_use",
+        "stop_sequence": null,
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5,
+          "cache_creation_input_tokens": 3,
+          "cache_read_input_tokens": 2,
+          "output_tokens_details": { "thinking_tokens": 4 },
+          "cache_creation": { "ephemeral_5m_input_tokens": 3, "ephemeral_1h_input_tokens": 0 },
+          "server_tool_use": { "web_search_requests": 0 }
+        }
+      }
+    },
+    {
+      "status": 200,
+      "headers": { "Content-Type": "application/json" },
+      "body": {
+        "id": "msg_2",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-test",
+        "content": [{ "type": "text", "text": "done" }],
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": {
+          "input_tokens": 20,
+          "output_tokens": 3,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 4,
+          "output_tokens_details": { "thinking_tokens": 0 },
+          "cache_creation": { "ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 0 },
+          "server_tool_use": { "web_search_requests": 0 }
+        }
+      }
+    }
+  ]
+}

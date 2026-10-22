@@ -1,0 +1,389 @@
+package jobs_test
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"path/filepath"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/LeXwDeX/Code-Review-For-Gitlab-CE/internal/jobs"
+	"github.com/LeXwDeX/Code-Review-For-Gitlab-CE/internal/store"
+	"github.com/LeXwDeX/Code-Review-For-Gitlab-CE/internal/store/sqlite"
+)
+
+type fakeClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *fakeClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *fakeClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(d)
+}
+
+func newFakeClock() *fakeClock {
+	return &fakeClock{now: time.Date(2026, 10, 22, 12, 0, 0, 0, time.UTC)}
+}
+
+func openStore(t *testing.T, clock *fakeClock) *sqlite.Store {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "jobs.db")
+	s, err := sqlite.Open(context.Background(), path, sqlite.WithClock(clock.Now))
+	if err != nil {
+		t.Fatalf("sqlite.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	return s
+}
+
+func waitFor(t *testing.T, timeout time.Duration, what string, check func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if check() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+func waitJob(t *testing.T, q *sqlite.Store, id, state string) *store.Job {
+	t.Helper()
+	var last *store.Job
+	waitFor(t, 3*time.Second, fmt.Sprintf("job %s state %s", id, state), func() bool {
+		job, err := q.GetJob(context.Background(), id)
+		if err != nil {
+			return false
+		}
+		last = job
+		return job.State == state
+	})
+	return last
+}
+
+func runWorker(t *testing.T, w *jobs.Worker) (context.CancelFunc, <-chan error) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		done <- w.Run(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-finished:
+		case <-time.After(3 * time.Second):
+			t.Error("worker did not stop")
+		}
+	})
+	return cancel, done
+}
+
+func TestWorkerDispatchesRegisteredKind(t *testing.T) {
+	ctx := context.Background()
+	q := openStore(t, newFakeClock())
+	jobID, _, err := q.Enqueue(ctx, jobs.Job{Kind: "review.run", Key: "review:1:1", Payload: json.RawMessage(`{"head":"abc"}`)})
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	handled := make(chan string, 1)
+	w := jobs.NewWorker(q, jobs.WorkerConfig{
+		Handlers: map[string]jobs.Handler{
+			"review.run": func(ctx context.Context, j *jobs.Job) error {
+				if ctx == nil {
+					return errors.New("nil context")
+				}
+				handled <- string(j.Payload)
+				return nil
+			},
+		},
+		Workers:      1,
+		Lease:        time.Second,
+		PollInterval: 5 * time.Millisecond,
+	})
+	_, _ = runWorker(t, w)
+
+	select {
+	case payload := <-handled:
+		if payload != `{"head":"abc"}` {
+			t.Errorf("payload = %s", payload)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("handler was not called")
+	}
+	job := waitJob(t, q, jobID, store.JobDone)
+	if job.Attempts != 1 || job.LeaseOwner != "" || job.LeaseUntil != nil {
+		t.Errorf("completed job = %+v", job)
+	}
+}
+
+func TestWorkerRetainsUnsupportedKinds(t *testing.T) {
+	ctx := context.Background()
+	q := openStore(t, newFakeClock())
+	unknownID, _, err := q.Enqueue(ctx, jobs.Job{Kind: "not.implemented", Key: "unknown:1"})
+	if err != nil {
+		t.Fatalf("Enqueue unknown: %v", err)
+	}
+	otherID, _, err := q.Enqueue(ctx, jobs.Job{Kind: "review.run", Key: "review:1:1"})
+	if err != nil {
+		t.Fatalf("Enqueue review: %v", err)
+	}
+
+	var calls atomic.Int32
+	w := jobs.NewWorker(q, jobs.WorkerConfig{
+		Handlers: map[string]jobs.Handler{
+			"workspace.refresh": func(context.Context, *jobs.Job) error {
+				calls.Add(1)
+				return nil
+			},
+		},
+		Workers:      1,
+		Lease:        time.Second,
+		PollInterval: 5 * time.Millisecond,
+	})
+	cancel, done := runWorker(t, w)
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("unregistered handler was called")
+	}
+	for _, id := range []string{unknownID, otherID} {
+		job, err := q.GetJob(ctx, id)
+		if err != nil {
+			t.Fatalf("GetJob: %v", err)
+		}
+		if job.State != store.JobQueued || job.Attempts != 0 {
+			t.Errorf("unsupported job %s = %+v, want untouched queued", id, job)
+		}
+	}
+}
+
+func TestWorkerStopsOnCancellationAndPropagatesContext(t *testing.T) {
+	ctx := context.Background()
+	q := openStore(t, newFakeClock())
+	jobID, _, err := q.Enqueue(ctx, jobs.Job{Kind: "slow", Key: "slow:1"})
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	w := jobs.NewWorker(q, jobs.WorkerConfig{
+		Handlers: map[string]jobs.Handler{
+			"slow": func(handlerCtx context.Context, _ *jobs.Job) error {
+				close(started)
+				<-handlerCtx.Done()
+				close(canceled)
+				return handlerCtx.Err()
+			},
+		},
+		Workers:      1,
+		Lease:        time.Minute,
+		PollInterval: 5 * time.Millisecond,
+	})
+	cancel, done := runWorker(t, w)
+	<-started
+	cancel()
+	select {
+	case <-canceled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("handler context was not cancelled")
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run did not stop")
+	}
+	// A cancelled handler must not mark the job done.
+	job, err := q.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if job.State == store.JobDone {
+		t.Fatalf("cancelled handler marked job done")
+	}
+}
+
+func TestWorkerLostLeaseCancelsHandler(t *testing.T) {
+	ctx := context.Background()
+	clock := newFakeClock()
+	q := openStore(t, clock)
+	jobID, _, err := q.Enqueue(ctx, jobs.Job{Kind: "leased", Key: "leased:1"})
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	w := jobs.NewWorker(q, jobs.WorkerConfig{
+		Handlers: map[string]jobs.Handler{
+			"leased": func(handlerCtx context.Context, _ *jobs.Job) error {
+				close(started)
+				<-handlerCtx.Done()
+				close(canceled)
+				return handlerCtx.Err()
+			},
+		},
+		Workers:      1,
+		Lease:        90 * time.Millisecond,
+		PollInterval: time.Second,
+		Now:          clock.Now,
+	})
+	cancel, done := runWorker(t, w)
+	<-started
+	// Make the stored lease expire before the next heartbeat. The recovery
+	// loop could also reclaim it; either way the handler must lose its lease.
+	clock.Advance(2 * time.Second)
+	select {
+	case <-canceled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("handler kept running after lease expiry")
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	job, err := q.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if job.State == store.JobDone {
+		t.Fatalf("expired job marked done: %+v", job)
+	}
+}
+
+func TestWorkerRetriesThenCompletes(t *testing.T) {
+	ctx := context.Background()
+	q := openStore(t, newFakeClock())
+	jobID, _, err := q.Enqueue(ctx, jobs.Job{Kind: "flaky", Key: "flaky:1", MaxAttempts: 3})
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	var attempts atomic.Int32
+	w := jobs.NewWorker(q, jobs.WorkerConfig{
+		Handlers: map[string]jobs.Handler{
+			"flaky": func(context.Context, *jobs.Job) error {
+				if attempts.Add(1) < 3 {
+					return errors.New("temporary failure with secret-text")
+				}
+				return nil
+			},
+		},
+		Workers:      1,
+		Lease:        time.Second,
+		PollInterval: 5 * time.Millisecond,
+		RetryBackoff: func(int) time.Duration { return time.Millisecond },
+	})
+	_, _ = runWorker(t, w)
+	job := waitJob(t, q, jobID, store.JobDone)
+	if job.Attempts != 3 {
+		t.Fatalf("attempts = %d, want 3", job.Attempts)
+	}
+	if attempts.Load() != 3 {
+		t.Fatalf("handler calls = %d, want 3", attempts.Load())
+	}
+}
+
+func TestWorkerRecoveryRunsWithEmptyHandlers(t *testing.T) {
+	ctx := context.Background()
+	clock := newFakeClock()
+	q := openStore(t, clock)
+	jobID, _, err := q.Enqueue(ctx, jobs.Job{Kind: "abandoned", Key: "abandoned:1"})
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	claimed, err := q.Claim(ctx, "crashed-worker", []string{"abandoned"}, 10*time.Second)
+	if err != nil || claimed == nil {
+		t.Fatalf("Claim: %v, %v", claimed, err)
+	}
+	clock.Advance(11 * time.Second)
+
+	w := jobs.NewWorker(q, jobs.WorkerConfig{
+		Workers:      1,
+		Lease:        10 * time.Second,
+		PollInterval: 10 * time.Millisecond,
+		Now:          clock.Now,
+	})
+	_, _ = runWorker(t, w)
+	job := waitJob(t, q, jobID, store.JobQueued)
+	if job.Attempts != 1 || job.LeaseOwner != "" {
+		t.Fatalf("recovered job = %+v", job)
+	}
+}
+
+func TestWorkerDoesNotRunQueuedSuccessorEarly(t *testing.T) {
+	ctx := context.Background()
+	q := openStore(t, newFakeClock())
+	key := "review:1:7"
+	if _, _, err := q.Enqueue(ctx, jobs.Job{Kind: "review.run", Key: key, Payload: json.RawMessage(`{"head":"a"}`)}); err != nil {
+		t.Fatalf("Enqueue first: %v", err)
+	}
+	release := make(chan struct{})
+	started := make(chan string, 2)
+	w := jobs.NewWorker(q, jobs.WorkerConfig{
+		Handlers: map[string]jobs.Handler{
+			"review.run": func(_ context.Context, j *jobs.Job) error {
+				started <- string(j.Payload)
+				if string(j.Payload) == `{"head":"a"}` {
+					<-release
+				}
+				return nil
+			},
+		},
+		Workers:      1,
+		Lease:        time.Minute,
+		PollInterval: 5 * time.Millisecond,
+	})
+	_, _ = runWorker(t, w)
+
+	select {
+	case payload := <-started:
+		if payload != `{"head":"a"}` {
+			t.Fatalf("first payload = %s", payload)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("first handler did not start")
+	}
+	successorID, _, err := q.Enqueue(ctx, jobs.Job{Kind: "review.run", Key: key, Payload: json.RawMessage(`{"head":"b"}`)})
+	if err != nil {
+		t.Fatalf("Enqueue successor: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	successor, err := q.GetJob(ctx, successorID)
+	if err != nil {
+		t.Fatalf("GetJob successor: %v", err)
+	}
+	if successor.State != store.JobQueued {
+		t.Fatalf("successor state = %s, want queued while first is running", successor.State)
+	}
+	close(release)
+
+	select {
+	case payload := <-started:
+		if payload != `{"head":"b"}` {
+			t.Fatalf("second payload = %s", payload)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("successor handler did not start after first completed")
+	}
+	waitJob(t, q, successorID, store.JobDone)
+}

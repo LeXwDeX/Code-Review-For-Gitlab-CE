@@ -1,0 +1,63 @@
+{
+  "exchanges": [
+    {
+      "status": 200,
+      "headers": { "Content-Type": "application/json" },
+      "body": {
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "created": 1,
+        "model": "test-chat",
+        "choices": [
+          {
+            "index": 0,
+            "finish_reason": "tool_calls",
+            "message": {
+              "role": "assistant",
+              "content": "checking",
+              "tool_calls": [
+                {
+                  "id": "call_1",
+                  "type": "function",
+                  "function": {
+                    "name": "read_file",
+                    "arguments": "{\"path\":\"README.md\"}"
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 10,
+          "completion_tokens": 5,
+          "total_tokens": 15,
+          "prompt_tokens_details": { "cached_tokens": 2, "cache_write_tokens": 1 },
+          "completion_tokens_details": { "reasoning_tokens": 0 }
+        }
+      }
+    },
+    {
+      "status": 200,
+      "headers": { "Content-Type": "application/json" },
+      "body": {
+        "id": "chatcmpl-2",
+        "object": "chat.completion",
+        "created": 2,
+        "model": "test-chat",
+        "choices": [
+          {
+            "index": 0,
+            "finish_reason": "stop",
+            "message": { "role": "assistant", "content": "done" }
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 20,
+          "completion_tokens": 3,
+          "total_tokens": 23
+        }
+      }
+    }
+  ]
+}

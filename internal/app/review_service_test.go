@@ -1,0 +1,822 @@
+package app
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/LeXwDeX/Code-Review-For-Gitlab-CE/internal/gitlab"
+	"github.com/LeXwDeX/Code-Review-For-Gitlab-CE/internal/review"
+	"github.com/LeXwDeX/Code-Review-For-Gitlab-CE/internal/store"
+	"github.com/LeXwDeX/Code-Review-For-Gitlab-CE/internal/store/sqlite"
+	"github.com/LeXwDeX/Code-Review-For-Gitlab-CE/pkg/dag"
+)
+
+const reviewTestHead = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+func TestReviewRunPublishesSummaryOnce(t *testing.T) {
+	f := newReviewFixture(t, reviewTestHead)
+	job := f.seedReview(t, "job-run-1")
+	if err := f.service.Handle(context.Background(), job); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	workflow, err := f.db.GetWorkflowByJob(context.Background(), job.ID)
+	if err != nil {
+		t.Fatalf("GetWorkflowByJob: %v", err)
+	}
+	if workflow.Status != "completed" {
+		t.Fatalf("workflow status = %q", workflow.Status)
+	}
+	if workflow.Profile != "default" {
+		t.Fatalf("workflow profile = %q", workflow.Profile)
+	}
+	if _, err := f.db.GetWorkflowDossier(context.Background(), workflow.ID); err != nil {
+		t.Fatalf("dossier: %v", err)
+	}
+	if got := f.gitlab.noteCount(); got != 1 {
+		t.Fatalf("notes = %d, want 1", got)
+	}
+	if f.gitlab.summaryCreates != 1 || f.gitlab.discussionCreates != 1 {
+		t.Fatalf("summary creates = %d, discussion creates = %d", f.gitlab.summaryCreates, f.gitlab.discussionCreates)
+	}
+	publications, err := f.db.ListPublications(context.Background(), workflow.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kinds := map[string]int{}
+	for _, publication := range publications {
+		kinds[publication.Kind]++
+	}
+	if kinds["summary"] != 1 || kinds["discussion"] != 1 {
+		t.Fatalf("publications = %+v", kinds)
+	}
+	findings, err := f.db.ListFindings(context.Background(), store.FindingFilter{WorkflowID: workflow.ID})
+	if err != nil || len(findings) != 1 {
+		t.Fatalf("findings = %d, err = %v", len(findings), err)
+	}
+
+	// A duplicate publish must update the existing summary and skip the
+	// existing discussion instead of creating new objects.
+	if err := f.publisher.Publish(context.Background(), workflow.ID); err != nil {
+		t.Fatalf("second Publish: %v", err)
+	}
+	if got := f.gitlab.noteCount(); got != 1 {
+		t.Fatalf("notes after duplicate publish = %d, want 1", got)
+	}
+	if f.gitlab.summaryCreates != 1 {
+		t.Fatalf("summary creates after duplicate publish = %d", f.gitlab.summaryCreates)
+	}
+	if f.gitlab.discussionCreates != 1 {
+		t.Fatalf("discussion creates after duplicate publish = %d", f.gitlab.discussionCreates)
+	}
+	if f.gitlab.summaryUpdates < 1 {
+		t.Fatalf("summary was not updated on duplicate publish")
+	}
+}
+
+func TestReviewRunSupersededBeforeCreation(t *testing.T) {
+	f := newReviewFixture(t, reviewTestHead)
+	job := f.seedReview(t, "job-run-2")
+	// A newer cancel (or push) wins before the job starts.
+	if _, err := f.db.EnqueueReviewLatest(context.Background(), store.ReviewCommand{
+		ProjectID: 42,
+		MRIID:     7,
+		Cancel:    true,
+		Payload:   mustJSONBody(t, map[string]any{"trigger": "command"}),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.service.Handle(context.Background(), job); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if _, err := f.db.GetWorkflowByJob(context.Background(), job.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("workflow was created for a superseded job: %v", err)
+	}
+	if f.gitlab.noteCount() != 0 {
+		t.Fatalf("superseded job published %d notes", f.gitlab.noteCount())
+	}
+}
+
+func TestReviewRunSupersededBeforePublication(t *testing.T) {
+	f := newReviewFixture(t, reviewTestHead)
+	job := f.seedReview(t, "job-run-3")
+	if err := f.service.Handle(context.Background(), job); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	workflow, err := f.db.GetWorkflowByJob(context.Background(), job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := f.gitlab.noteCount()
+	if _, err := f.db.EnqueueReviewLatest(context.Background(), store.ReviewCommand{
+		ProjectID: 42,
+		MRIID:     7,
+		Cancel:    true,
+		Payload:   mustJSONBody(t, map[string]any{"trigger": "command"}),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	err = f.publisher.Publish(context.Background(), workflow.ID)
+	if !errors.Is(err, ErrStalePublication) {
+		t.Fatalf("Publish error = %v, want stale", err)
+	}
+	if f.gitlab.noteCount() != before {
+		t.Fatalf("stale publish created a note")
+	}
+	dossier, err := f.db.GetWorkflowDossier(context.Background(), workflow.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dossier.PublicationState != store.WorkflowPublicationSkipped {
+		t.Fatalf("publication state = %q", dossier.PublicationState)
+	}
+}
+
+func TestReviewDossierPersistsFreshnessMetadata(t *testing.T) {
+	f := newReviewFixture(t, reviewTestHead)
+	job := f.seedReview(t, "job-meta-1")
+	if err := f.service.Handle(context.Background(), job); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	workflow, err := f.db.GetWorkflowByJob(context.Background(), job.ID)
+	if err != nil {
+		t.Fatalf("GetWorkflowByJob: %v", err)
+	}
+	record, err := f.db.GetWorkflowDossier(context.Background(), workflow.ID)
+	if err != nil {
+		t.Fatalf("GetWorkflowDossier: %v", err)
+	}
+	var dossier review.Dossier
+	if err := json.Unmarshal(record.Data, &dossier); err != nil {
+		t.Fatalf("decode dossier: %v", err)
+	}
+	configHash := dossier.Metadata["config_hash"]
+	promptHash := dossier.Metadata["prompt_hash"]
+	if configHash == "" || promptHash == "" || dossier.Metadata["base_sha"] == "" {
+		t.Fatalf("dossier metadata = %+v", dossier.Metadata)
+	}
+	if promptHash != f.bundle.Hash {
+		t.Fatalf("prompt_hash = %q, want %q", promptHash, f.bundle.Hash)
+	}
+	if dossier.Metadata["base_sha"] != f.gitlab.version.BaseSHA {
+		t.Fatalf("base_sha = %q, want %q", dossier.Metadata["base_sha"], f.gitlab.version.BaseSHA)
+	}
+	if workflow.Fingerprint != reviewFingerprint(record.Hash, configHash, promptHash) {
+		t.Fatalf("workflow fingerprint = %q", workflow.Fingerprint)
+	}
+}
+
+func TestPublishRejectsChangedConfigAndPromptHashes(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(t *testing.T, f *reviewFixture)
+	}{
+		{
+			name: "config",
+			mutate: func(t *testing.T, f *reviewFixture) {
+				f.gitlab.mu.Lock()
+				f.gitlab.docs["AGENTS.md"] = "changed repository configuration"
+				f.gitlab.mu.Unlock()
+			},
+		},
+		{
+			name: "prompt",
+			mutate: func(_ *testing.T, f *reviewFixture) {
+				f.publisher.promptsHash = "changed-prompt-hash"
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newReviewFixture(t, reviewTestHead)
+			job := f.seedReview(t, "job-stale-"+tc.name)
+			if err := f.service.Handle(context.Background(), job); err != nil {
+				t.Fatalf("Handle: %v", err)
+			}
+			workflow, err := f.db.GetWorkflowByJob(context.Background(), job.ID)
+			if err != nil {
+				t.Fatalf("GetWorkflowByJob: %v", err)
+			}
+			if err := f.publisher.Publish(context.Background(), workflow.ID); err != nil {
+				t.Fatalf("baseline Publish: %v", err)
+			}
+			tc.mutate(t, f)
+			err = f.publisher.Publish(context.Background(), workflow.ID)
+			if !errors.Is(err, ErrStalePublication) {
+				t.Fatalf("Publish error = %v, want ErrStalePublication", err)
+			}
+			record, err := f.db.GetWorkflowDossier(context.Background(), workflow.ID)
+			if err != nil {
+				t.Fatalf("GetWorkflowDossier: %v", err)
+			}
+			if record.PublicationState != store.WorkflowPublicationSkipped {
+				t.Fatalf("publication state = %q, want skipped", record.PublicationState)
+			}
+		})
+	}
+}
+
+func TestReviewRetryRestartsRunningNodeAndKeepsTerminalOutput(t *testing.T) {
+	f := newReviewFixture(t, reviewTestHead)
+	job := f.seedReview(t, "job-retry-running")
+	generation := jobGeneration(t, job)
+	dossier := testDossier(t, f.head)
+	configHash, promptHash := currentReviewHashes(t, f)
+	dossier.Metadata = map[string]string{"config_hash": configHash, "prompt_hash": promptHash}
+	raw, err := review.MarshalDossier(dossier)
+	if err != nil {
+		t.Fatalf("MarshalDossier: %v", err)
+	}
+	hash, err := review.DossierHash(dossier)
+	if err != nil {
+		t.Fatalf("DossierHash: %v", err)
+	}
+	spec := dag.GraphSpec{
+		Nodes: []dag.NodeSpec{
+			{ID: "plan", Kind: review.KindPlan, Required: true, Timeout: time.Minute, Params: json.RawMessage(`{"mode":"code"}`)},
+			{ID: "gather", Kind: review.KindGather, DependsOn: []string{"plan"}, Required: true, Timeout: time.Minute, Params: json.RawMessage(`{}`)},
+		},
+		Budget: dag.Budget{MaxNodes: 30, Deadline: 5 * time.Minute},
+	}
+	wfID, _, err := f.db.CreateReviewWorkflow(context.Background(), sqlite.ReviewWorkflowRequest{
+		JobID:              job.ID,
+		Spec:               spec,
+		Meta:               map[string]string{"trigger": "mr_open", "base_sha": dossier.DiffVersion.BaseSHA, "fingerprint": reviewFingerprint(hash, configHash, promptHash), "config_hash": configHash, "prompt_hash": promptHash},
+		DossierVersion:     review.DossierSchemaVersion,
+		DossierHash:        hash,
+		DossierData:        raw,
+		ExpectedGeneration: generation,
+		ProjectID:          42,
+		MRIID:              7,
+		HeadSHA:            f.head,
+	})
+	if err != nil {
+		t.Fatalf("CreateReviewWorkflow: %v", err)
+	}
+	event := func(kind string, payload any) dag.Event {
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatalf("marshal %s: %v", kind, err)
+		}
+		return dag.Event{Type: kind, Payload: encoded, At: time.Now().UTC()}
+	}
+	if _, err := f.db.Append(context.Background(), wfID, 1,
+		event(dag.EventNodeStarted, dag.NodeStartedPayload{NodeID: "plan", Attempt: 1}),
+		event(dag.EventNodeCompleted, dag.NodeCompletedPayload{NodeID: "plan", Attempt: 1, Output: json.RawMessage(`{"ok":true}`)}),
+		event(dag.EventNodeStarted, dag.NodeStartedPayload{NodeID: "gather", Attempt: 1}),
+	); err != nil {
+		t.Fatalf("Append setup events: %v", err)
+	}
+
+	if err := f.service.Handle(context.Background(), job); err != nil {
+		t.Fatalf("retry Handle: %v", err)
+	}
+	snapshot, err := f.engine.Snapshot(context.Background(), wfID)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if snapshot.Status != dag.WorkflowCompleted {
+		t.Fatalf("workflow status = %q, want completed", snapshot.Status)
+	}
+	gather := snapshot.Nodes["gather"]
+	if gather.Attempt != 2 || gather.Status != dag.NodeCompleted {
+		t.Fatalf("gather = attempt %d status %q, want attempt 2 completed", gather.Attempt, gather.Status)
+	}
+	plan := snapshot.Nodes["plan"]
+	if plan.Attempt != 1 || plan.Status != dag.NodeCompleted || string(plan.Output) != `{"ok":true}` {
+		t.Fatalf("terminal plan changed: attempt %d status %q output %s", plan.Attempt, plan.Status, plan.Output)
+	}
+}
+
+func TestReviewRetryAfterConfigChangeRebuildsWorkflow(t *testing.T) {
+	f := newReviewFixture(t, reviewTestHead)
+	job := f.seedReview(t, "job-config-change")
+	generation := jobGeneration(t, job)
+	oldConfigHash, oldPromptHash := currentReviewHashes(t, f)
+
+	dossier := testDossier(t, f.head)
+	dossier.Metadata = map[string]string{"config_hash": oldConfigHash, "prompt_hash": oldPromptHash}
+	raw, err := review.MarshalDossier(dossier)
+	if err != nil {
+		t.Fatalf("MarshalDossier: %v", err)
+	}
+	hash, err := review.DossierHash(dossier)
+	if err != nil {
+		t.Fatalf("DossierHash: %v", err)
+	}
+	spec := dag.GraphSpec{
+		Nodes: []dag.NodeSpec{
+			{ID: "plan", Kind: review.KindPlan, Required: true, Timeout: time.Minute, Params: json.RawMessage(`{"mode":"code"}`)},
+			{ID: "gather", Kind: review.KindGather, DependsOn: []string{"plan"}, Required: true, Timeout: time.Minute, Params: json.RawMessage(`{}`)},
+		},
+		Budget: dag.Budget{MaxNodes: 30, Deadline: 5 * time.Minute},
+	}
+	oldID, _, err := f.db.CreateReviewWorkflow(context.Background(), sqlite.ReviewWorkflowRequest{
+		JobID:              job.ID,
+		Spec:               spec,
+		Meta:               map[string]string{"trigger": "mr_open", "base_sha": dossier.DiffVersion.BaseSHA, "fingerprint": reviewFingerprint(hash, oldConfigHash, oldPromptHash), "config_hash": oldConfigHash, "prompt_hash": oldPromptHash},
+		DossierVersion:     review.DossierSchemaVersion,
+		DossierHash:        hash,
+		DossierData:        raw,
+		ExpectedGeneration: generation,
+		ProjectID:          42,
+		MRIID:              7,
+		HeadSHA:            f.head,
+	})
+	if err != nil {
+		t.Fatalf("CreateReviewWorkflow: %v", err)
+	}
+
+	f.gitlab.mu.Lock()
+	f.gitlab.docs["AGENTS.md"] = "changed repository configuration"
+	f.gitlab.mu.Unlock()
+
+	if err := f.service.Handle(context.Background(), job); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	oldWorkflow, err := f.db.GetWorkflow(context.Background(), oldID)
+	if err != nil {
+		t.Fatalf("GetWorkflow old: %v", err)
+	}
+	if oldWorkflow.Status != string(dag.WorkflowCancelled) {
+		t.Fatalf("old workflow status = %q, want cancelled", oldWorkflow.Status)
+	}
+	oldDossier, err := f.db.GetWorkflowDossier(context.Background(), oldID)
+	if err != nil {
+		t.Fatalf("GetWorkflowDossier old: %v", err)
+	}
+	if oldDossier.JobID != "" || oldDossier.PublicationState != store.WorkflowPublicationSkipped {
+		t.Fatalf("old dossier = job %q state %q, want detached and skipped", oldDossier.JobID, oldDossier.PublicationState)
+	}
+	publications, err := f.db.ListPublications(context.Background(), oldID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(publications) != 0 {
+		t.Fatalf("old workflow published %d objects", len(publications))
+	}
+
+	newWorkflow, err := f.db.GetWorkflowByJob(context.Background(), job.ID)
+	if err != nil {
+		t.Fatalf("GetWorkflowByJob: %v", err)
+	}
+	if newWorkflow.ID == oldID {
+		t.Fatal("retry reused the workflow built for the old configuration")
+	}
+	if newWorkflow.Status != string(dag.WorkflowCompleted) {
+		t.Fatalf("new workflow status = %q", newWorkflow.Status)
+	}
+	newDossier, err := f.db.GetWorkflowDossier(context.Background(), newWorkflow.ID)
+	if err != nil {
+		t.Fatalf("GetWorkflowDossier new: %v", err)
+	}
+	var stored review.Dossier
+	if err := json.Unmarshal(newDossier.Data, &stored); err != nil {
+		t.Fatalf("decode dossier: %v", err)
+	}
+	newConfigHash := stored.Metadata["config_hash"]
+	if newConfigHash == "" || newConfigHash == oldConfigHash {
+		t.Fatalf("config_hash = %q, want a new hash different from %q", newConfigHash, oldConfigHash)
+	}
+	if newDossier.PublicationState != store.WorkflowPublicationPublished {
+		t.Fatalf("new dossier publication state = %q, want published", newDossier.PublicationState)
+	}
+	if got := f.gitlab.noteCount(); got != 1 {
+		t.Fatalf("notes = %d, want 1", got)
+	}
+}
+
+// staleControlStore reports the old generation once, then the durable control.
+// It reproduces a lease expiry where a successor job advances the generation
+// between the first check and the configuration-change branch.
+type staleControlStore struct {
+	*sqlite.Store
+
+	mu    sync.Mutex
+	calls int
+	stale store.ReviewControl
+}
+
+func (s *staleControlStore) GetReviewControl(ctx context.Context, projectID, mrIID int64) (*store.ReviewControl, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls++
+	if s.calls == 1 {
+		control := s.stale
+		return &control, nil
+	}
+	return s.Store.GetReviewControl(ctx, projectID, mrIID)
+}
+
+// successorStore runs onRead after the resumable dossier is read. It
+// reproduces a successor job replacing the workflow while this worker runs.
+type successorStore struct {
+	*sqlite.Store
+
+	mu        sync.Mutex
+	triggered bool
+	onRead    func()
+}
+
+func (s *successorStore) GetWorkflowDossier(ctx context.Context, workflowID string) (*store.WorkflowDossier, error) {
+	dossier, err := s.Store.GetWorkflowDossier(ctx, workflowID)
+	if err == nil {
+		s.mu.Lock()
+		run := !s.triggered
+		s.triggered = true
+		s.mu.Unlock()
+		if run {
+			s.onRead()
+		}
+	}
+	return dossier, err
+}
+
+// seedSuccessorReview advances the MR generation and creates its pending
+// workflow, as a successor job would after this worker's lease expired.
+func (f *reviewFixture) seedSuccessorReview(t *testing.T, jobID string) string {
+	t.Helper()
+	result, err := f.db.EnqueueReviewLatest(context.Background(), store.ReviewCommand{
+		ProjectID:   42,
+		MRIID:       7,
+		HeadSHA:     f.head,
+		Payload:     json.RawMessage(`{"trigger":"mr_update","profile":"default","full":true}`),
+		MaxAttempts: 3,
+	})
+	if err != nil {
+		t.Fatalf("EnqueueReviewLatest successor: %v", err)
+	}
+	return createPendingReview(t, f, jobID, result.Generation)
+}
+
+func TestStaleWorkerDoesNotCancelNewerGenerationOnConfigChange(t *testing.T) {
+	f := newReviewFixture(t, reviewTestHead)
+	oldJob := f.seedReview(t, "job-stale-config")
+	oldWorkflowID := createPendingReview(t, f, oldJob.ID, jobGeneration(t, oldJob))
+
+	store := &successorStore{Store: f.db}
+	store.onRead = func() {
+		if err := f.engine.Cancel(context.Background(), oldWorkflowID, "successor"); err != nil {
+			t.Fatalf("cancel old workflow: %v", err)
+		}
+		f.seedSuccessorReview(t, "job-successor-config")
+	}
+	f.service.store = store
+
+	err := f.service.RunReview(context.Background(), oldJob)
+	if !errors.Is(err, ErrReviewSuperseded) {
+		t.Fatalf("RunReview error = %v, want ErrReviewSuperseded", err)
+	}
+	newWorkflow, err := f.db.GetWorkflowByJob(context.Background(), "job-successor-config")
+	if err != nil {
+		t.Fatalf("GetWorkflowByJob successor: %v", err)
+	}
+	if newWorkflow.Status != string(dag.WorkflowPending) {
+		t.Fatalf("newer workflow status = %q, want pending", newWorkflow.Status)
+	}
+	oldWorkflow, err := f.db.GetWorkflow(context.Background(), oldWorkflowID)
+	if err != nil {
+		t.Fatalf("GetWorkflow old: %v", err)
+	}
+	if oldWorkflow.Status != string(dag.WorkflowCancelled) {
+		t.Fatalf("old workflow status = %q, want cancelled by the successor", oldWorkflow.Status)
+	}
+}
+
+func TestRunStartCancelDoesNotCancelNewerGeneration(t *testing.T) {
+	f := newReviewFixture(t, reviewTestHead)
+	oldJob := f.seedReview(t, "job-start-cancel")
+	oldGeneration := jobGeneration(t, oldJob)
+	oldWorkflowID := createPendingReview(t, f, oldJob.ID, oldGeneration)
+	if err := f.engine.Cancel(context.Background(), oldWorkflowID, "seed"); err != nil {
+		t.Fatalf("seed cancel: %v", err)
+	}
+	newWorkflowID := f.seedSuccessorReview(t, "job-start-successor")
+
+	f.service.store = &staleControlStore{
+		Store: f.db,
+		stale: store.ReviewControl{
+			ProjectID:  42,
+			MRIID:      7,
+			Generation: oldGeneration,
+			HeadSHA:    f.head,
+		},
+	}
+
+	err := f.service.RunReview(context.Background(), oldJob)
+	if !errors.Is(err, ErrReviewSuperseded) {
+		t.Fatalf("RunReview error = %v, want ErrReviewSuperseded", err)
+	}
+	newWorkflow, err := f.db.GetWorkflow(context.Background(), newWorkflowID)
+	if err != nil {
+		t.Fatalf("GetWorkflow new: %v", err)
+	}
+	if newWorkflow.Status != string(dag.WorkflowPending) {
+		t.Fatalf("newer workflow status = %q, want pending", newWorkflow.Status)
+	}
+	oldWorkflow, err := f.db.GetWorkflow(context.Background(), oldWorkflowID)
+	if err != nil {
+		t.Fatalf("GetWorkflow old: %v", err)
+	}
+	if oldWorkflow.Status != string(dag.WorkflowCancelled) {
+		t.Fatalf("old workflow status = %q, want cancelled", oldWorkflow.Status)
+	}
+}
+
+func TestCancelActiveCancelsPreviousGeneration(t *testing.T) {
+	f := newReviewFixture(t, reviewTestHead)
+	f.seedReview(t, "job-generation-1")
+	oldWorkflowID := createPendingReview(t, f, "job-old-generation", 1)
+	newJob := f.seedReview(t, "job-generation-2")
+
+	if err := f.service.cancelActive(context.Background(), 42, 7, jobGeneration(t, newJob)); err != nil {
+		t.Fatalf("cancelActive: %v", err)
+	}
+	oldWorkflow, err := f.db.GetWorkflow(context.Background(), oldWorkflowID)
+	if err != nil {
+		t.Fatalf("GetWorkflow old: %v", err)
+	}
+	if oldWorkflow.Status != string(dag.WorkflowCancelled) {
+		t.Fatalf("previous generation status = %q, want cancelled", oldWorkflow.Status)
+	}
+}
+
+func TestMaxFilesZeroNormalizesToSameReviewHash(t *testing.T) {
+	f := newReviewFixture(t, reviewTestHead)
+	f.defaults.MaxFiles = 0
+	f.service.reviewDefaults = f.defaults
+	f.publisher.reviewDefaults = f.defaults
+
+	project, err := f.db.GetProject(context.Background(), 42)
+	if err != nil {
+		t.Fatalf("GetProject: %v", err)
+	}
+	serviceCfg := f.service.resolveConfig(project, review.RepoDocs{})
+	publisherCfg, err := f.publisher.freshConfig(context.Background(), &loadedReview{
+		workflow: &store.Workflow{ID: "wf-max-files"},
+		dossier:  testDossier(t, f.head),
+		project:  project,
+		token:    "token",
+		mrIID:    7,
+	})
+	if err != nil {
+		t.Fatalf("freshConfig: %v", err)
+	}
+	if serviceCfg.Settings.MaxFiles != defaultReviewMaxFiles || publisherCfg.Settings.MaxFiles != defaultReviewMaxFiles {
+		t.Fatalf("max files = service %d publisher %d, want %d",
+			serviceCfg.Settings.MaxFiles, publisherCfg.Settings.MaxFiles, defaultReviewMaxFiles)
+	}
+	if serviceHash, publisherHash := reviewConfigHash(serviceCfg), reviewConfigHash(publisherCfg); serviceHash != publisherHash {
+		t.Fatalf("config hashes differ: service %q publisher %q", serviceHash, publisherHash)
+	}
+}
+
+func TestRecoverRunVerifiesWorktreeHead(t *testing.T) {
+	t.Run("matching head is reused", func(t *testing.T) {
+		f := newReviewFixture(t, reviewTestHead)
+		project, err := f.db.GetProject(context.Background(), 42)
+		if err != nil {
+			t.Fatalf("GetProject: %v", err)
+		}
+		headDir := filepath.Join(f.manager.Get(42).Root, "runs", "job-r8")
+		if err := os.MkdirAll(headDir, 0o700); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		f.git.dirHeads[headDir] = f.head
+		dossier := testDossier(t, f.head)
+		dossier.HeadDir = headDir
+		dir, cleanup, err := f.service.recoverRun(context.Background(), project, "token", 7, "job-r8", "wf-r8", *dossier)
+		if err != nil {
+			t.Fatalf("recoverRun: %v", err)
+		}
+		if cleanup != nil {
+			defer cleanup()
+		}
+		if dir != headDir {
+			t.Fatalf("dir = %q, want %q", dir, headDir)
+		}
+		if f.git.addCalls != 0 || f.git.removeCalls != 0 {
+			t.Fatalf("worktree was rebuilt: add=%d remove=%d", f.git.addCalls, f.git.removeCalls)
+		}
+	})
+
+	t.Run("wrong head rebuilds", func(t *testing.T) {
+		f := newReviewFixture(t, reviewTestHead)
+		project, err := f.db.GetProject(context.Background(), 42)
+		if err != nil {
+			t.Fatalf("GetProject: %v", err)
+		}
+		headDir := filepath.Join(f.manager.Get(42).Root, "runs", "job-r7")
+		if err := os.MkdirAll(headDir, 0o700); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		f.git.dirHeads[headDir] = strings.Repeat("3", 40)
+		dossier := testDossier(t, f.head)
+		dossier.HeadDir = headDir
+		dir, cleanup, err := f.service.recoverRun(context.Background(), project, "token", 7, "job-r7", "wf-r7", *dossier)
+		if err != nil {
+			t.Fatalf("recoverRun: %v", err)
+		}
+		if cleanup != nil {
+			defer cleanup()
+		}
+		if dir != headDir {
+			t.Fatalf("dir = %q, want rebuilt %q", dir, headDir)
+		}
+		if f.git.addCalls != 1 || f.git.removeCalls != 1 {
+			t.Fatalf("worktree rebuild calls: add=%d remove=%d", f.git.addCalls, f.git.removeCalls)
+		}
+		if f.git.dirHeads[headDir] != f.head {
+			t.Fatalf("rebuilt head = %q, want %q", f.git.dirHeads[headDir], f.head)
+		}
+	})
+
+	t.Run("unowned path is never deleted", func(t *testing.T) {
+		f := newReviewFixture(t, reviewTestHead)
+		project, err := f.db.GetProject(context.Background(), 42)
+		if err != nil {
+			t.Fatalf("GetProject: %v", err)
+		}
+		outside := t.TempDir()
+		f.git.dirHeads[outside] = strings.Repeat("4", 40)
+		dossier := testDossier(t, f.head)
+		dossier.HeadDir = outside
+		dir, cleanup, err := f.service.recoverRun(context.Background(), project, "token", 7, "job-r9", "wf-r9", *dossier)
+		if err != nil {
+			t.Fatalf("recoverRun: %v", err)
+		}
+		if cleanup != nil {
+			defer cleanup()
+		}
+		if dir == outside {
+			t.Fatalf("unowned path was reused")
+		}
+		if _, err := os.Stat(outside); err != nil {
+			t.Fatalf("unowned path was removed: %v", err)
+		}
+	})
+}
+
+func TestReviewCancelSettlesWorkflow(t *testing.T) {
+	f := newReviewFixture(t, reviewTestHead)
+	job := f.seedReview(t, "job-run-4")
+	generation := jobGeneration(t, job)
+	wfID := createPendingReview(t, f, "job-pending-4", generation)
+	cancelJob := f.seedCancel(t, "job-cancel-4")
+	if err := f.service.Handle(context.Background(), cancelJob); err != nil {
+		t.Fatalf("cancel Handle: %v", err)
+	}
+	workflow, err := f.db.GetWorkflow(context.Background(), wfID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if workflow.Status != "cancelled" {
+		t.Fatalf("workflow status = %q, want cancelled", workflow.Status)
+	}
+	publications, err := f.db.ListPublications(context.Background(), wfID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(publications) != 0 {
+		t.Fatalf("cancel published %d objects", len(publications))
+	}
+	if _, err := f.db.FindActiveReview(context.Background(), 42, 7); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("active review remains after cancel: %v", err)
+	}
+	_ = job
+}
+
+func TestReviewRecoverRunsPendingAndPublishes(t *testing.T) {
+	f := newReviewFixture(t, reviewTestHead)
+	job := f.seedReview(t, "job-run-5")
+	if err := f.service.Handle(context.Background(), job); err != nil {
+		t.Fatalf("first Handle: %v", err)
+	}
+	first, err := f.db.GetWorkflowByJob(context.Background(), job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstRev := first.GraphRev
+	pendingID := createPendingReview(t, f, "job-pending-5", jobGeneration(t, job))
+	// A completed workflow whose publication was lost must be retried too.
+	if err := f.db.SetWorkflowPublicationState(context.Background(), first.ID, store.WorkflowPublicationPending); err != nil {
+		t.Fatal(err)
+	}
+	beforeNotes := f.gitlab.noteCount()
+	if err := f.service.Recover(context.Background()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	pending, err := f.db.GetWorkflow(context.Background(), pendingID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending.Status != "completed" {
+		t.Fatalf("pending workflow status = %q", pending.Status)
+	}
+	reloaded, err := f.db.GetWorkflow(context.Background(), first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.GraphRev != firstRev {
+		t.Fatalf("completed workflow was re-run: rev %d -> %d", firstRev, reloaded.GraphRev)
+	}
+	if got := f.gitlab.noteCount(); got != beforeNotes {
+		t.Fatalf("recovery created a new summary note: %d -> %d", beforeNotes, got)
+	}
+	if f.runner.count() != 2 {
+		t.Fatalf("agent runs = %d, want 2 (first run + pending recovery)", f.runner.count())
+	}
+}
+
+func TestReviewRunClosedMRIsPermanent(t *testing.T) {
+	f := newReviewFixture(t, reviewTestHead)
+	f.gitlab.mr.State = "merged"
+	job := f.seedReview(t, "job-run-6")
+	if err := f.service.Handle(context.Background(), job); err != nil {
+		t.Fatalf("closed MR should settle the job, got %v", err)
+	}
+	if _, err := f.db.GetWorkflowByJob(context.Background(), job.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("closed MR created a workflow")
+	}
+}
+
+func TestReviewRunNoReviewableFilesPublishesSummary(t *testing.T) {
+	f := newReviewFixture(t, reviewTestHead)
+	f.gitlab.diffs = []gitlab.FileDiff{{NewPath: "go.sum", Diff: "@@ -1 +1 @@\n-a\n+b\n"}}
+	f.defaults.Ignore = []string{"**/*.sum"}
+	f.service.reviewDefaults = f.defaults
+	job := f.seedReview(t, "job-run-7")
+	if err := f.service.Handle(context.Background(), job); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if f.gitlab.noteCount() != 1 {
+		t.Fatalf("notes = %d, want one empty summary", f.gitlab.noteCount())
+	}
+	if !strings.Contains(f.gitlab.notes[0].Body, review.SummaryMarkerPrefix) {
+		t.Fatalf("summary marker missing")
+	}
+}
+
+func TestReviewCancelSettlesRunningWorkflow(t *testing.T) {
+	f := newReviewFixture(t, reviewTestHead)
+	f.runner.block = make(chan struct{})
+	f.runner.started = make(chan struct{})
+	runJob := f.seedReview(t, "job-running-cancel")
+	wfID := createPendingReview(t, f, "job-running-cancel", jobGeneration(t, runJob))
+	dossier := testDossier(t, f.head)
+	index := gitlab.BuildDiffIndex(dossier.DiffVersion, dossierDiffs(dossier))
+	executor, err := review.NewExecutor(review.ExecutorDeps{
+		Dossier:  dossier,
+		Profile:  review.Profile{Name: "default", Config: testReviewProfile()},
+		Graph:    review.GraphConfig{AllowedProviders: []string{"fake"}},
+		Prompts:  f.bundle,
+		AgentRun: f.runner.Run,
+		Snapshot: engineSnapshot(f.engine),
+		Locate:   locateFunc(index),
+	})
+	if err != nil {
+		t.Fatalf("NewExecutor: %v", err)
+	}
+	f.executors.Register(wfID, executor)
+	defer f.executors.Unregister(wfID)
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- f.engine.Run(context.Background(), wfID) }()
+	select {
+	case <-f.runner.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("review did not start")
+	}
+	cancelJob := f.seedCancel(t, "job-cancel-running")
+	if err := f.service.Handle(context.Background(), cancelJob); err != nil {
+		t.Fatalf("cancel Handle: %v", err)
+	}
+	select {
+	case <-runDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("engine did not stop after cancel")
+	}
+	workflow, err := f.db.GetWorkflow(context.Background(), wfID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if workflow.Status != "cancelled" {
+		t.Fatalf("workflow status = %q, want cancelled", workflow.Status)
+	}
+	publications, err := f.db.ListPublications(context.Background(), wfID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(publications) != 0 {
+		t.Fatalf("cancelled workflow published %d objects", len(publications))
+	}
+}
+
+var _ = dag.WorkflowCancelled

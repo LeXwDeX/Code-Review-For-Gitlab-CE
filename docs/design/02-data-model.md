@@ -20,7 +20,7 @@
 | `publications` | 发布 | 已发布到 GitLab 的对象，用于幂等 |
 | `llm_calls` | 审计 | 每次模型调用 |
 | `feedback` | 反馈 | 👍/👎、resolve 信号 |
-| `users`、`sessions`、`api_tokens` | 访问控制 | Web 控制台登录与 CLI token |
+| `users`、`sessions`、`api_tokens` | 访问控制 | Web 控制台登录与 CLI token；`sessions` 表当前未使用 |
 
 ---
 
@@ -106,13 +106,14 @@ CREATE TABLE block_bindings (
 );
 
 CREATE TABLE webhook_deliveries (
-  uuid        TEXT    PRIMARY KEY,    -- X-Gitlab-Event-UUID
+  uuid        TEXT    NOT NULL,       -- X-Gitlab-Event-UUID，按项目去重
   project_id  INTEGER NOT NULL,
   event       TEXT    NOT NULL,       -- Merge Request Hook | Note Hook | Push Hook
   outcome     TEXT    NOT NULL,       -- enqueued | ignored | rejected
   reason      TEXT,
   job_id      TEXT,
-  received_at TEXT    NOT NULL
+  received_at TEXT    NOT NULL,
+  PRIMARY KEY (project_id, uuid)
 );
 
 CREATE TABLE jobs (
@@ -131,7 +132,9 @@ CREATE TABLE jobs (
   updated_at  TEXT    NOT NULL
 );
 CREATE INDEX jobs_claim ON jobs (state, run_after);
-CREATE UNIQUE INDEX jobs_active_key ON jobs (key) WHERE state IN ('queued', 'running');
+-- 运行期间的新事件保留为一个排队后继，不被旧任务去重丢弃。
+CREATE UNIQUE INDEX jobs_active_key ON jobs (key, state)
+  WHERE key IS NOT NULL AND state IN ('queued', 'running');
 
 CREATE TABLE workflows (
   id           TEXT    PRIMARY KEY,
@@ -285,7 +288,11 @@ CREATE TABLE sessions (
   expires_at TEXT    NOT NULL,
   created_at TEXT    NOT NULL
 );
+```
 
+> 实现偏差：当前浏览器会话保存在服务进程内存中（`internal/server/auth.go`），不读写 `sessions` 表。重启后所有浏览器会话失效，用户需要重新登录。
+
+```sql
 CREATE TABLE api_tokens (
   id           TEXT    PRIMARY KEY,
   user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -345,6 +352,8 @@ SQLite 必要的 PRAGMA：`journal_mode=WAL`、`busy_timeout=5000`、`foreign_ke
 ---
 
 ## 5. 保留与清理
+
+> 实现状态：以下策略是目标设计，当前**未实现定时清理**。`storage.llm_call_retention` 只有配置项和设置视图；`ClearLLMPayloads` 方法存在但没有调用方。项目注销时会删除该项目的 webhook 记录等数据，属于注销路径，不是保留策略。
 
 | 数据 | 默认保留 | 清理方式 |
 |---|---|---|

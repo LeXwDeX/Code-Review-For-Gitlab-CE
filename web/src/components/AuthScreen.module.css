@@ -1,0 +1,56 @@
+.wrap {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: var(--bg);
+}
+
+.brandBar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 18px;
+}
+
+.brandText {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.25;
+}
+
+.brandName { font-size: 16px; font-weight: 700; }
+.brandSub { color: var(--muted); font-size: 12px; }
+
+.card {
+  width: min(440px, 100%);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 28px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.title { font-size: 22px; font-weight: 700; }
+.text { color: var(--muted); line-height: 1.7; }
+.notice {
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  background: var(--warn-bg);
+  color: var(--warn-fg);
+}
+.footer { color: var(--muted); font-size: 12px; }
+
+.loadingWrap {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg);
+}
+
+.actions { display: flex; flex-wrap: wrap; gap: 8px; }

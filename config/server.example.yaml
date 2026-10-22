@@ -1,0 +1,54 @@
+# Minimal M0 configuration.
+# 1. Replace gitlab.url with your GitLab base URL.
+# 2. Export REVIEW_MASTER_KEY (base64 of exactly 32 random bytes):
+#      openssl rand -base64 32
+# 3. Export REVIEW_ADMIN_TOKEN (at least 32 bytes).
+server:
+  listen: ":8080"
+  public_url: "http://localhost:8080"
+  read_timeout: 15s
+  write_timeout: 60s
+
+gitlab:
+  url: "https://gitlab.example.internal"
+  request_timeout: 30s
+  max_concurrency: 16
+
+auth:
+  bootstrap_token_env: REVIEW_ADMIN_TOKEN
+  session_ttl: 168h
+
+storage:
+  driver: sqlite
+  dsn: "file:data/review.db"
+  llm_call_retention: 720h
+
+secrets:
+  master_key_env: REVIEW_MASTER_KEY
+
+workspace:
+  root: "data/workspaces"
+  git_bin: "git"
+  context_refresh:
+    changed_files: 200
+    max_age: 168h
+  run_cleanup_after: 1h
+
+jobs:
+  workers: 4
+  lease: 5m
+
+engine:
+  max_concurrent_nodes: 8
+  default_node_timeout: 10m
+
+profiles:
+  default:
+    plan: { mode: code, package_tokens: 60000 }
+    on_uncertain: mark
+    synthesize: { mode: code }
+    budget: { max_nodes: 30, max_extends: 0, deadline: 20m, max_tokens: 1500000 }
+
+review_defaults:
+  language: zh-CN
+  skip_draft: true

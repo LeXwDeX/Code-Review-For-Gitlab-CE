@@ -70,14 +70,17 @@ sequenceDiagram
 
 ## F2 新 push 取消旧评审
 
-1. `review_service` 领取新 job 后，查询 `workflows_active_review` 中同 `(project_id, mr_iid)` 的工作流。
-2. 对其调用 `Engine.Cancel(wf, "superseded_by:<new_wf>")`：运行中节点的 context 被取消，LLM 请求中断。
-3. 旧工作流不会发布任何内容（发布前 fingerprint 校验也会拦住迟到的结果）。
-4. 新工作流开始 F1 第 4 步。
+1. webhook、已授权的评论命令或手动 API 在入队事务内记录同 `(project_id, mr_iid)` 的最新评审代次或取消意图。重复 delivery 不增加代次。
+2. 取消不能依赖领取同 key 的后继 `review.run`：M0 队列只会在旧任务结束后领取后继。控制任务独立于长评审执行；运行中的评审也检查持久化意图，不能只靠内存通知。
+3. 旧评审在创建工作流前检查代次，运行中发现已被替代时调用 `Engine.Cancel`。取消返回前应持久化工作流终态，并取消节点 context。用户取消不作为可重试的执行失败。
+4. 旧工作流不会发布任何内容。发布前同时检查代次与完整 fingerprint，拦住创建前取消、进程重启和迟到结果。
+5. 旧 job 结束后，新工作流开始 F1 第 4 步。即使 `jobs.workers=1`，控制路径也必须可执行。
 
 ---
 
 ## F3 评论命令
+
+M0 先把命令持久化为 `review.command`，以下 GitLab 校验由 worker 执行，不在 webhook handler 内执行。M0 只完成权限校验和目标任务入队，不执行评审、命令回复或表情回执。
 
 1. Note Hook 到达，正文以 `/review` 开头。
 2. 忽略：作者是项目 bot 用户；MR 已关闭或合并。
@@ -121,13 +124,14 @@ sequenceDiagram
 
 服务启动时依次执行：
 
-1. `jobs`：`state=running` 且租约过期的任务改回 `queued`，`attempts+1`；超过 `max_attempts` 的标为 `failed`。
-2. `Engine.Recover`：对每个未终态工作流，
+1. `jobs`：`state=running` 且租约过期的任务改回 `queued`；`attempts` 只在下一次领取时加一，避免重复计数。已达到 `max_attempts` 的标为 `failed`；若已有同 key 的更新 queued 后继，取消旧任务而不覆盖后继。
+2. 应用层先恢复工作流对应的脱敏材料快照、配置与 prompt 快照、工作区读锁及 head worktree，再调用 `Engine.Recover`。不得重新采集当前输入并与已完成节点的旧结果混用。对每个未终态工作流，
    - `running` 节点：写 `node.restarted`，重置为 `pending`，`attempt+1`。
    - `queued` 节点：保持 `queued`（幂等重入）。
    - 然后重新进入调度循环。
-3. 评审节点无副作用，重跑安全。发布阶段靠 F7 的幂等保证不会重复评论。
-4. 遗留的 `runs/*` 目录在启动时清理（对应工作流已终态的才删）。
+3. 评审节点无副作用，重跑安全。job 重试关联原工作流，不重跑已完成节点。已有 run worktree 必须校验 HEAD 后复用；缺失时从 mirror 恢复。材料缺失或 base 漂移时明确失败，不混跑。
+4. 还需恢复「已完成但尚未发布」的工作流；它们不属于引擎的未终态集合。发布阶段靠 F7 的幂等恢复，材料快照、事件和日志不得含项目 token、provider key 或 MCP 密钥。
+5. 遗留的 `runs/*` 目录在启动时清理（对应工作流已终态且不再需要发布恢复的才删）。
 
 ---
 
@@ -135,7 +139,7 @@ sequenceDiagram
 
 前置：工作流 `completed`。
 
-1. **fingerprint 校验**：重新 `GET MR`，若 `head_sha` 已变化 → 不发布，工作流记 `cancel_reason=stale`。
+1. **fingerprint 校验**：重新检查当前 MR 的 head/base、有效配置哈希、prompt 版本和持久化评审代次。任一不一致则不发布，记录 stale 原因；不能只比对 `head_sha`。发布期间保持工作区读锁。
 2. **汇总评论**：
    1. 查 `publications(kind=summary)`；有 `gitlab_id` → `PUT .../notes/:note_id` 更新。
    2. 没有记录 → 列出 MR 的 notes，找作者为本 bot 且正文首行含 `<!-- gitlab-ce-review:summary` 的评论；找到则更新并补记录，找不到则新建。

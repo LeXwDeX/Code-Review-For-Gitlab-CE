@@ -8,6 +8,8 @@
 
 默认路径 `config/server.yaml`，可用 `--config` 指定，也可以传多个文件按顺序合并。字符串中的 `${ENV_NAME}` 在加载时展开；密钥类字段**只接受** `*_env` 形式，不允许明文写在文件里。
 
+当前最小启动示例见 [`config/server.example.yaml`](../../config/server.example.yaml)，但它没有 `providers` 和 `profiles.*.propose`，只能启动服务、注册项目和跑路由，**不能执行真实评审**；要跑评审必须先补齐 provider、profile 的 `propose` / `challenge` 等配置。OAuth 可选：不配置时 `/auth/login` 返回 503，Bearer 仍可用。当前存储只实现 SQLite，配置 `postgres` 会在启动时明确报错。管理 API 使用 `auth.bootstrap_token_env`（默认 `REVIEW_ADMIN_TOKEN`，至少 32 字节）；浏览器登录和用户级 API token 已实现。多文件加载递归合并映射、替换数组，拒绝未知字段、重复键和多文档 YAML；环境变量在解析后的字符串上展开，避免改变 YAML 结构。
+
 ```yaml
 server:
   listen: ":8080"
@@ -63,7 +65,7 @@ providers:
     rpm: 50
     max_tokens: 16000
     thinking: { budget_tokens: 8000 }
-    price: { input_per_mtok: 0, output_per_mtok: 0 }   # 用于成本统计，按实际填写
+    price: { input_per_mtok: 0, output_per_mtok: 0 }   # USD / 百万 token；用于估算，按实际填写
   gpt:
     protocol: openai-responses
     base_url: "https://api.openai.com/v1"
@@ -256,6 +258,8 @@ type ProfileConfig struct {
 
 ## 4. 仓库内 `.gitlab-review.yml`
 
+> 实现偏差：平台 → 项目设置 → 仓库配置的三层优先级只在评审执行阶段由 `resolveReviewConfig` 部分应用。webhook 过滤（Draft、标签、目标分支）在入队前使用项目设置，早于仓库配置的合并；因此仓库级 `skip_draft` / `labels_exclude` 不能阻止已入队的评审。仓库级 `profile` 会在评审时覆盖项目档位。
+
 只读取**目标分支**上的版本；`allow_repo_config=false` 时完全忽略。
 
 ```yaml
@@ -282,6 +286,7 @@ review:
 | 变量 | 用途 |
 |---|---|
 | `REVIEW_MASTER_KEY` | 主密钥（base64 32 字节），加密项目 token 和 webhook secret |
+| `REVIEW_ADMIN_TOKEN` | 管理 API 的 bootstrap Bearer token，至少 32 字节；可由 `auth.bootstrap_token_env` 改名 |
 | `GITLAB_OAUTH_CLIENT_ID` / `GITLAB_OAUTH_CLIENT_SECRET` | 控制台登录 |
 | `ANTHROPIC_API_KEY`、`OPENAI_API_KEY`、… | 按 `providers.*.api_key_env` 自定义 |
 | `REVIEW_LOG_LEVEL` | `debug` / `info` / `warn` / `error` |
