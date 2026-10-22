@@ -12,6 +12,9 @@ var (
 	ErrNotFound  = errors.New("store: not found")
 	ErrConflict  = errors.New("store: conflict")
 	ErrLeaseLost = errors.New("store: lease lost")
+	// ErrIncompleteWorkflow marks a workflow row without its dossier. Retrying
+	// the job cannot repair it, so callers must settle it as permanent.
+	ErrIncompleteWorkflow = errors.New("store: workflow has no dossier")
 )
 
 const (

@@ -33,9 +33,8 @@ import (
 )
 
 const (
-	defaultCancelPoll     = 2 * time.Second
-	defaultCancelWait     = 45 * time.Second
-	defaultReviewMaxFiles = 200
+	defaultCancelPoll = 2 * time.Second
+	defaultCancelWait = 45 * time.Second
 )
 
 // ReviewStore is the persistence surface needed by review orchestration.
@@ -397,13 +396,18 @@ func (s *ReviewService) RunReview(ctx context.Context, job *jobs.Job) error {
 			s.logger.Info("review workflow superseded before creation", "project_id", project.ID, "mr_iid", payload.MRIID)
 			return nil
 		}
+		if errors.Is(err, store.ErrIncompleteWorkflow) {
+			return PermanentJob(fmt.Errorf("resume review workflow: %w", err))
+		}
 		return err
 	}
 
 	// A push may land between CreateReviewWorkflow and the event append.
 	if _, err := s.currentControl(ctx, project.ID, control.MRIID, payload.Generation, payload.HeadSHA); err != nil {
 		if IsPermanentJob(err) {
-			_ = s.engine.Cancel(context.WithoutCancel(ctx), wfID, "superseded")
+			if cancelErr := s.engine.Cancel(context.WithoutCancel(ctx), wfID, "superseded"); cancelErr != nil && !errors.Is(cancelErr, dag.ErrNotFound) {
+				s.logger.Warn("cancel superseded workflow failed", "workflow_id", wfID, "error", cancelErr.Error())
+			}
 			return nil
 		}
 		return err
@@ -488,12 +492,39 @@ func (s *ReviewService) CancelReview(ctx context.Context, job *jobs.Job) error {
 		// A newer review.run replaced this cancel; do not touch it.
 		return nil
 	}
+	if payload.Generation > 0 && control.Generation != payload.Generation {
+		return nil
+	}
 	active, err := s.store.FindActiveReview(ctx, payload.ProjectID, payload.MRIID)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return nil
 		}
 		return err
+	}
+	// The active workflow may belong to a newer generation when a push lands
+	// between the control read and this lookup. Never cancel it.
+	if payload.Generation > 0 {
+		dossier, err := s.store.GetWorkflowDossier(ctx, active.ID)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				return nil
+			}
+			return err
+		}
+		if dossier.Generation > payload.Generation {
+			return nil
+		}
+	}
+	control, err = s.store.GetReviewControl(ctx, payload.ProjectID, payload.MRIID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil
+		}
+		return err
+	}
+	if !control.Cancelled || (payload.Generation > 0 && control.Generation != payload.Generation) {
+		return nil
 	}
 	if err := s.engine.Cancel(ctx, active.ID, "user_cancelled"); err != nil {
 		if errors.Is(err, dag.ErrNotFound) {
@@ -948,7 +979,7 @@ func resolveReviewConfig(project *store.Project, docs review.RepoDocs, defaults 
 	}
 	// Normalize once so the review service and publisher hash the same value.
 	if out.Settings.MaxFiles <= 0 {
-		out.Settings.MaxFiles = defaultReviewMaxFiles
+		out.Settings.MaxFiles = review.DefaultMaxFiles
 	}
 	if !out.Settings.AllowRepoConfig || strings.TrimSpace(docs.GitLabReviewConfig) == "" {
 		return out
@@ -1164,6 +1195,13 @@ func (s *ReviewService) publishEmpty(ctx context.Context, project *store.Project
 	if s.publisher == nil {
 		return errors.New("app: review publisher is not configured")
 	}
+	recheck := func() error {
+		_, err := s.currentControl(ctx, project.ID, control.MRIID, control.Generation, inputs.Version.HeadSHA)
+		return err
+	}
+	if err := recheck(); err != nil {
+		return err
+	}
 	profileName, _ := s.profileFor(project, "", cfg.Profile, inputs.MR.Labels)
 	fingerprint := sha256Hex(strings.Join([]string{
 		inputs.Version.HeadSHA, reviewConfigHash(cfg), profileName,
@@ -1178,6 +1216,10 @@ func (s *ReviewService) publishEmpty(ctx context.Context, project *store.Project
 	})
 	if err != nil {
 		return PermanentJob(fmt.Errorf("render empty summary: %w", err))
+	}
+	// A push can land while the summary is rendered; never publish stale text.
+	if err := recheck(); err != nil {
+		return err
 	}
 	return s.publisher.PublishStandaloneSummary(ctx, project.ID, control.MRIID, token, fingerprint, body)
 }

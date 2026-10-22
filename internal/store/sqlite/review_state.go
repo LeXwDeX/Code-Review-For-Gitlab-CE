@@ -349,6 +349,9 @@ func (s *Store) CreateReviewWorkflow(ctx context.Context, req ReviewWorkflowRequ
 	if existing, err := s.GetWorkflowByJob(ctx, req.JobID); err == nil {
 		dossier, err := s.GetWorkflowDossier(ctx, existing.ID)
 		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				return "", false, fmt.Errorf("%w: workflow %s for job %s", store.ErrIncompleteWorkflow, existing.ID, req.JobID)
+			}
 			return "", false, err
 		}
 		control, err := s.GetReviewControl(ctx, req.ProjectID, req.MRIID)

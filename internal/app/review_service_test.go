@@ -569,9 +569,9 @@ func TestMaxFilesZeroNormalizesToSameReviewHash(t *testing.T) {
 	if err != nil {
 		t.Fatalf("freshConfig: %v", err)
 	}
-	if serviceCfg.Settings.MaxFiles != defaultReviewMaxFiles || publisherCfg.Settings.MaxFiles != defaultReviewMaxFiles {
+	if serviceCfg.Settings.MaxFiles != review.DefaultMaxFiles || publisherCfg.Settings.MaxFiles != review.DefaultMaxFiles {
 		t.Fatalf("max files = service %d publisher %d, want %d",
-			serviceCfg.Settings.MaxFiles, publisherCfg.Settings.MaxFiles, defaultReviewMaxFiles)
+			serviceCfg.Settings.MaxFiles, publisherCfg.Settings.MaxFiles, review.DefaultMaxFiles)
 	}
 	if serviceHash, publisherHash := reviewConfigHash(serviceCfg), reviewConfigHash(publisherCfg); serviceHash != publisherHash {
 		t.Fatalf("config hashes differ: service %q publisher %q", serviceHash, publisherHash)
@@ -817,6 +817,125 @@ func TestReviewCancelSettlesRunningWorkflow(t *testing.T) {
 	if len(publications) != 0 {
 		t.Fatalf("cancelled workflow published %d objects", len(publications))
 	}
+}
+
+// cancelRaceStore triggers a successor review exactly when the cancel job
+// looks up the active workflow, reproducing a push landing in that window.
+type cancelRaceStore struct {
+	*sqlite.Store
+	once   sync.Once
+	onFind func()
+}
+
+func (s *cancelRaceStore) FindActiveReview(ctx context.Context, projectID, mrIID int64) (*store.Workflow, error) {
+	s.once.Do(func() {
+		if s.onFind != nil {
+			s.onFind()
+		}
+	})
+	return s.Store.FindActiveReview(ctx, projectID, mrIID)
+}
+
+func TestCancelReviewDoesNotCancelNewerGeneration(t *testing.T) {
+	f := newReviewFixture(t, reviewTestHead)
+	oldJob := f.seedReview(t, "job-cancel-race-old")
+	oldWorkflow := createPendingReview(t, f, oldJob.ID, jobGeneration(t, oldJob))
+	cancelJob := f.seedCancel(t, "job-cancel-race")
+
+	var newerWorkflow string
+	race := &cancelRaceStore{Store: f.db}
+	race.onFind = func() {
+		if err := f.engine.Cancel(context.Background(), oldWorkflow, "successor"); err != nil {
+			t.Fatalf("cancel old workflow: %v", err)
+		}
+		result, err := f.db.EnqueueReviewLatest(context.Background(), store.ReviewCommand{
+			ProjectID:   42,
+			MRIID:       7,
+			HeadSHA:     f.head,
+			Payload:     json.RawMessage(`{"trigger":"mr_update","profile":"default","full":true}`),
+			MaxAttempts: 3,
+		})
+		if err != nil {
+			t.Fatalf("successor enqueue: %v", err)
+		}
+		newerWorkflow = createPendingReview(t, f, "job-cancel-race-new", result.Generation)
+	}
+	f.service.store = race
+
+	if err := f.service.CancelReview(context.Background(), cancelJob); err != nil {
+		t.Fatalf("CancelReview: %v", err)
+	}
+	if newerWorkflow == "" {
+		t.Fatal("successor workflow was not created")
+	}
+	snapshot, err := f.engine.Snapshot(context.Background(), newerWorkflow)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if snapshot.Status == dag.WorkflowCancelled {
+		t.Fatalf("newer generation workflow was cancelled")
+	}
+	// The old workflow belongs to this cancel generation and may be cancelled;
+	// the invariant under test is that the newer one is untouched.
+	_ = oldWorkflow
+}
+
+// publishRaceStore advances the review generation before the second control
+// read inside publishEmpty.
+type publishRaceStore struct {
+	*sqlite.Store
+	mu       sync.Mutex
+	calls    int
+	onSecond func()
+}
+
+func (s *publishRaceStore) GetReviewControl(ctx context.Context, projectID, mrIID int64) (*store.ReviewControl, error) {
+	s.mu.Lock()
+	s.calls++
+	call := s.calls
+	s.mu.Unlock()
+	if call == 2 && s.onSecond != nil {
+		s.onSecond()
+	}
+	return s.Store.GetReviewControl(ctx, projectID, mrIID)
+}
+
+func TestPublishEmptyRejectsControlChangeBeforePublish(t *testing.T) {
+	f := newReviewFixture(t, reviewTestHead)
+	job := f.seedReview(t, "job-empty-race")
+	control, err := f.db.GetReviewControl(context.Background(), 42, 7)
+	if err != nil {
+		t.Fatalf("GetReviewControl: %v", err)
+	}
+	project, err := f.db.GetProject(context.Background(), 42)
+	if err != nil {
+		t.Fatalf("GetProject: %v", err)
+	}
+	race := &publishRaceStore{Store: f.db}
+	race.onSecond = func() {
+		if _, err := f.db.EnqueueReviewLatest(context.Background(), store.ReviewCommand{
+			ProjectID:   42,
+			MRIID:       7,
+			HeadSHA:     f.head,
+			Payload:     json.RawMessage(`{"trigger":"mr_update","profile":"default","full":true}`),
+			MaxAttempts: 3,
+		}); err != nil {
+			t.Fatalf("successor enqueue: %v", err)
+		}
+	}
+	f.service.store = race
+	inputs := &reviewInputs{
+		MR:      &gitlab.MergeRequest{IID: 7, State: "opened", SHA: f.head, Labels: nil},
+		Version: &gitlab.Version{HeadSHA: f.head, BaseSHA: strings.Repeat("c", 40), StartSHA: strings.Repeat("c", 40)},
+	}
+	err = f.service.publishEmpty(context.Background(), project, "token", control, inputs, effectiveReviewConfig{Settings: f.defaults})
+	if !errors.Is(err, ErrReviewSuperseded) {
+		t.Fatalf("publishEmpty error = %v, want ErrReviewSuperseded", err)
+	}
+	if f.gitlab.noteCount() != 0 {
+		t.Fatalf("stale empty summary was published (%d notes)", f.gitlab.noteCount())
+	}
+	_ = job
 }
 
 var _ = dag.WorkflowCancelled
