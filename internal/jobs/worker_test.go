@@ -96,7 +96,8 @@ func runWorker(t *testing.T, w *jobs.Worker) (context.CancelFunc, <-chan error) 
 
 func TestWorkerDispatchesRegisteredKind(t *testing.T) {
 	ctx := context.Background()
-	q := openStore(t, newFakeClock())
+	clock := newFakeClock()
+	q := openStore(t, clock)
 	jobID, _, err := q.Enqueue(ctx, jobs.Job{Kind: "review.run", Key: "review:1:1", Payload: json.RawMessage(`{"head":"abc"}`)})
 	if err != nil {
 		t.Fatalf("Enqueue: %v", err)
@@ -114,6 +115,7 @@ func TestWorkerDispatchesRegisteredKind(t *testing.T) {
 		},
 		Workers:      1,
 		Lease:        time.Second,
+		Now:          clock.Now,
 		PollInterval: 5 * time.Millisecond,
 	})
 	_, _ = runWorker(t, w)
@@ -134,7 +136,8 @@ func TestWorkerDispatchesRegisteredKind(t *testing.T) {
 
 func TestWorkerRetainsUnsupportedKinds(t *testing.T) {
 	ctx := context.Background()
-	q := openStore(t, newFakeClock())
+	clock := newFakeClock()
+	q := openStore(t, clock)
 	unknownID, _, err := q.Enqueue(ctx, jobs.Job{Kind: "not.implemented", Key: "unknown:1"})
 	if err != nil {
 		t.Fatalf("Enqueue unknown: %v", err)
@@ -154,6 +157,7 @@ func TestWorkerRetainsUnsupportedKinds(t *testing.T) {
 		},
 		Workers:      1,
 		Lease:        time.Second,
+		Now:          clock.Now,
 		PollInterval: 5 * time.Millisecond,
 	})
 	cancel, done := runWorker(t, w)
@@ -178,7 +182,8 @@ func TestWorkerRetainsUnsupportedKinds(t *testing.T) {
 
 func TestWorkerStopsOnCancellationAndPropagatesContext(t *testing.T) {
 	ctx := context.Background()
-	q := openStore(t, newFakeClock())
+	clock := newFakeClock()
+	q := openStore(t, clock)
 	jobID, _, err := q.Enqueue(ctx, jobs.Job{Kind: "slow", Key: "slow:1"})
 	if err != nil {
 		t.Fatalf("Enqueue: %v", err)
@@ -196,6 +201,7 @@ func TestWorkerStopsOnCancellationAndPropagatesContext(t *testing.T) {
 		},
 		Workers:      1,
 		Lease:        time.Minute,
+		Now:          clock.Now,
 		PollInterval: 5 * time.Millisecond,
 	})
 	cancel, done := runWorker(t, w)
@@ -273,7 +279,8 @@ func TestWorkerLostLeaseCancelsHandler(t *testing.T) {
 
 func TestWorkerRetriesThenCompletes(t *testing.T) {
 	ctx := context.Background()
-	q := openStore(t, newFakeClock())
+	clock := newFakeClock()
+	q := openStore(t, clock)
 	jobID, _, err := q.Enqueue(ctx, jobs.Job{Kind: "flaky", Key: "flaky:1", MaxAttempts: 3})
 	if err != nil {
 		t.Fatalf("Enqueue: %v", err)
@@ -290,8 +297,9 @@ func TestWorkerRetriesThenCompletes(t *testing.T) {
 		},
 		Workers:      1,
 		Lease:        time.Second,
+		Now:          clock.Now,
 		PollInterval: 5 * time.Millisecond,
-		RetryBackoff: func(int) time.Duration { return time.Millisecond },
+		RetryBackoff: func(int) time.Duration { return 0 },
 	})
 	_, _ = runWorker(t, w)
 	job := waitJob(t, q, jobID, store.JobDone)
@@ -332,7 +340,8 @@ func TestWorkerRecoveryRunsWithEmptyHandlers(t *testing.T) {
 
 func TestWorkerDoesNotRunQueuedSuccessorEarly(t *testing.T) {
 	ctx := context.Background()
-	q := openStore(t, newFakeClock())
+	clock := newFakeClock()
+	q := openStore(t, clock)
 	key := "review:1:7"
 	if _, _, err := q.Enqueue(ctx, jobs.Job{Kind: "review.run", Key: key, Payload: json.RawMessage(`{"head":"a"}`)}); err != nil {
 		t.Fatalf("Enqueue first: %v", err)
@@ -351,6 +360,7 @@ func TestWorkerDoesNotRunQueuedSuccessorEarly(t *testing.T) {
 		},
 		Workers:      1,
 		Lease:        time.Minute,
+		Now:          clock.Now,
 		PollInterval: 5 * time.Millisecond,
 	})
 	_, _ = runWorker(t, w)
