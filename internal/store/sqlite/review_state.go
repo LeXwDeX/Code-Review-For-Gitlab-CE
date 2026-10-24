@@ -716,31 +716,36 @@ func decompressDossier(compressed []byte) ([]byte, error) {
 	return data, nil
 }
 
-// HasPublishedSevereFinding reports whether the most recently published
-// review for one MR has an unresolved P0/P1 finding. Findings that were
-// dropped (refuted) are excluded; published and marked findings count.
+// HasPublishedSevereFinding reports whether incremental history is unsafe for
+// one MR. A summary from a non-completed workflow is treated as unknown, so a
+// failure summary cannot narrow the next review. Findings that were dropped
+// (refuted) are excluded; published and marked findings count.
 func (s *Store) HasPublishedSevereFinding(ctx context.Context, projectID, mrIID int64) (bool, error) {
 	if projectID <= 0 || mrIID <= 0 {
 		return false, errors.New("sqlite: project id and mr iid are required")
 	}
 	var one int
-	err := s.db.QueryRowContext(ctx, `SELECT 1
-		FROM findings f
-		WHERE f.workflow_id = (
-			SELECT p.workflow_id FROM publications p
-			WHERE p.project_id = ? AND p.mr_iid = ?
-			ORDER BY p.updated_at DESC, p.id DESC LIMIT 1
-		)
-		  AND COALESCE(NULLIF(f.final_severity, ''), f.severity) IN ('P0', 'P1')
-		  AND f.decision IN ('publish', 'mark', 'downgrade')
-		LIMIT 1`, projectID, mrIID).Scan(&one)
+	err := s.db.QueryRowContext(ctx, `SELECT CASE
+			WHEN w.status <> 'completed' THEN 1
+			WHEN EXISTS (
+				SELECT 1 FROM findings f
+				WHERE f.workflow_id = w.id
+				  AND COALESCE(NULLIF(f.final_severity, ''), f.severity) IN ('P0', 'P1')
+				  AND f.decision IN ('publish', 'mark', 'downgrade')
+			) THEN 1
+			ELSE 0
+		END
+		FROM publications p
+		JOIN workflows w ON w.id = p.workflow_id
+		WHERE p.project_id = ? AND p.mr_iid = ? AND p.kind = 'summary'
+		ORDER BY p.updated_at DESC, p.id DESC LIMIT 1`, projectID, mrIID).Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
 	if err != nil {
 		return false, fmt.Errorf("sqlite: has published severe finding: %w", err)
 	}
-	return true, nil
+	return one != 0, nil
 }
 
 // SetWorkflowPublicationState updates the publish state and its bounded,

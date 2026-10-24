@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/LeXwDeX/Code-Review-For-Gitlab-CE/internal/store"
+	"github.com/LeXwDeX/Code-Review-For-Gitlab-CE/pkg/dag"
 )
 
 func publishedFinding(id, severity, decision string) store.Finding {
@@ -34,8 +35,8 @@ func mustPublication(t *testing.T, s *Store, projectID, mrIID int64, workflowID,
 	}
 }
 
-// HasPublishedSevereFinding looks only at the most recently published review
-// and only at findings that were actually published or marked uncertain.
+// HasPublishedSevereFinding looks only at the most recent summary and only at
+// findings that were actually published or marked uncertain.
 func TestHasPublishedSevereFindingUsesLatestPublishedReview(t *testing.T) {
 	ctx := context.Background()
 	clock := newFakeClock()
@@ -99,6 +100,61 @@ func TestHasPublishedSevereFindingUsesLatestPublishedReview(t *testing.T) {
 	// clean apart from a P2, so incremental review stays allowed.
 	if severe, err = s.HasPublishedSevereFinding(ctx, 42, 7); err != nil || severe {
 		t.Fatalf("latest review severe = %v, %v, want false", severe, err)
+	}
+}
+
+func TestHasPublishedSevereFindingTreatsFailedSummaryAsUnknown(t *testing.T) {
+	ctx := context.Background()
+	clock := newFakeClock()
+	s := openTestStore(t, clock)
+	mustProject(t, s, 42)
+
+	first, err := s.EnqueueReviewLatest(ctx, store.ReviewCommand{
+		ProjectID: 42, MRIID: 7, HeadSHA: reviewHead("a"),
+	})
+	if err != nil {
+		t.Fatalf("enqueue first: %v", err)
+	}
+	wfA, _, err := s.CreateReviewWorkflow(ctx, reviewWorkflowRequest(first.JobID, first.Generation, 42, 7, reviewHead("a")))
+	if err != nil {
+		t.Fatalf("create first: %v", err)
+	}
+	finishWorkflow(t, s, wfA, 1, clock.Now())
+	mustPublication(t, s, 42, 7, wfA, "summary-a")
+	if err := s.ReplaceFindings(ctx, wfA, []store.Finding{publishedFinding("f-a", "P1", "publish")}); err != nil {
+		t.Fatalf("ReplaceFindings: %v", err)
+	}
+
+	clock.Advance(time.Second)
+	second, err := s.EnqueueReviewLatest(ctx, store.ReviewCommand{
+		ProjectID: 42, MRIID: 7, HeadSHA: reviewHead("b"),
+	})
+	if err != nil {
+		t.Fatalf("enqueue second: %v", err)
+	}
+	wfB, _, err := s.CreateReviewWorkflow(ctx, reviewWorkflowRequest(second.JobID, second.Generation, 42, 7, reviewHead("b")))
+	if err != nil {
+		t.Fatalf("create second: %v", err)
+	}
+	rev := mustAppendEvent(t, s, wfB, 1, testEvent(t, dag.EventWorkflowStarted, dag.WorkflowTerminalPayload{}, clock.Now()))
+	rev = mustAppendEvent(t, s, wfB, rev, queuedEvent(t, "a", 1, clock.Now()))
+	rev = mustAppendEvent(t, s, wfB, rev, startedEvent(t, "a", 1, "p", "m", clock.Now()))
+	rev = mustAppendEvent(t, s, wfB, rev, testEvent(t, dag.EventNodeFailed, dag.NodeFailedPayload{
+		NodeID: "a", Attempt: 1, Error: "agent failed",
+	}, clock.Now()))
+	rev = mustAppendEvent(t, s, wfB, rev, queuedEvent(t, "b", 1, clock.Now()))
+	rev = mustAppendEvent(t, s, wfB, rev, startedEvent(t, "b", 1, "p", "m", clock.Now()))
+	rev = mustAppendEvent(t, s, wfB, rev, testEvent(t, dag.EventNodeFailed, dag.NodeFailedPayload{
+		NodeID: "b", Attempt: 1, Error: "agent failed",
+	}, clock.Now()))
+	if _, err := s.Append(ctx, wfB, rev, testEvent(t, dag.EventWorkflowFailed, dag.WorkflowTerminalPayload{Reason: "agent failed"}, clock.Now())); err != nil {
+		t.Fatalf("fail second workflow: %v", err)
+	}
+	mustPublication(t, s, 42, 7, wfB, "summary-b")
+
+	severe, err := s.HasPublishedSevereFinding(ctx, 42, 7)
+	if err != nil || !severe {
+		t.Fatalf("failed summary history = %v, %v, want true (unknown)", severe, err)
 	}
 }
 

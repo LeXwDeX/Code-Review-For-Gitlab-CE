@@ -589,13 +589,14 @@ func (s *Store) SetWorkflowVerdict(ctx context.Context, id, verdict string) erro
 	return nil
 }
 
-// LastPublishedHead returns the head SHA of the most recent publication for an
-// MR. It returns an empty string when nothing was published.
+// LastPublishedHead returns the head SHA of the most recent summary publication
+// for an MR. It returns an empty string when nothing was published.
 func (s *Store) LastPublishedHead(ctx context.Context, projectID, mrIID int64) (string, error) {
 	var sha string
 	err := s.db.QueryRowContext(ctx, `SELECT w.head_sha
 		FROM publications p JOIN workflows w ON w.id = p.workflow_id
 		WHERE p.project_id = ? AND p.mr_iid = ?
+		  AND p.kind = 'summary'
 		  AND w.head_sha IS NOT NULL AND w.head_sha <> ''
 		ORDER BY p.updated_at DESC, p.id DESC LIMIT 1`, projectID, mrIID).Scan(&sha)
 	if errors.Is(err, sql.ErrNoRows) {
