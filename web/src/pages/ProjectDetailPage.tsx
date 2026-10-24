@@ -88,10 +88,10 @@ function ProjectOverview({ project }: { project: Project }) {
         {stats.isError ? <ErrorState error={stats.error} onRetry={() => { void stats.refetch() }} title="项目统计加载失败" /> : null}
         {!stats.isPending && !stats.isError ? (
           <div className={styles.statGrid}>
-            <Metric label="评审次数" value={runs === null ? '不可用' : runs} note={`BLOCKING ${blocking === null ? '不可用' : blocking} 次`} />
+            <Metric label="运行次数" value={runs === null ? '不可用' : runs} note={`包含评审与 onboarding · BLOCKING ${blocking === null ? '不可用' : blocking} 次`} />
             <Metric label="BLOCKING 比例" value={formatRatio(blockingRatio)} note="来自 stats.blocking_ratio" />
             <Metric label="已发布问题" value={published === null ? '不可用' : published} note="来自 stats.published" />
-            <Metric label="被挑战推翻" value={formatRatio(overturned)} note="来自 stats.overturned_ratio" />
+            <Metric label="规则丢弃比例" value={formatRatio(overturned)} note="规则 drop 占比，不是模型准确率" />
             <Metric label="成本" value={cost === null ? '不可用' : formatCost(cost)} note={`平均 ${formatMs(avg)} · P95 ${formatMs(p95)}`} />
           </div>
         ) : null}
@@ -99,7 +99,7 @@ function ProjectOverview({ project }: { project: Project }) {
 
       <Panel title="最近评审" aside={<Link to={`/reviews?project_id=${project.id}`}>查看全部</Link>}>
         {reviews.isPending ? <LoadingState /> : null}
-        {reviews.isError ? <ErrorState error={reviews.error} onRetry={reviews.refetch} /> : null}
+        {reviews.isError ? <ErrorState error={reviews.error} onRetry={reviews.retry} /> : null}
         {reviews.isSuccess && reviews.items.length === 0 ? <EmptyState title="这个项目还没有评审记录" description="打开 MR 或手动触发一次评审。" /> : null}
         {reviews.items.length ? <ReviewTable reviews={reviews.items} projectNames={projectNames} /> : null}
         {reviews.hasNextPage ? <Button variant="secondary" onClick={reviews.fetchNextPage} loading={reviews.isFetchingNextPage}>加载更多评审</Button> : null}
@@ -114,6 +114,7 @@ function ProjectExtensionsPanel({ project }: { project: Project }) {
     <ExtensionsManager
       scope="project"
       projectId={project.id}
+      canManage={project.access === 'manage'}
       projects={[project]}
       tab={subTab}
       onTabChange={setSubTab}
@@ -185,7 +186,7 @@ export function ProjectDetailPage() {
 
         <div role="tabpanel" aria-labelledby={`tab-${tab}`}>
           {tab === 'overview' ? <ProjectOverview project={data} /> : null}
-          {tab === 'workspace' ? <WorkspacePanel projectId={data.id} /> : null}
+          {tab === 'workspace' ? <WorkspacePanel projectId={data.id} canManage={data.access === 'manage'} /> : null}
           {tab === 'settings' ? <SettingsPanel project={data} /> : null}
           {tab === 'extensions' ? <ProjectExtensionsPanel project={data} /> : null}
         </div>

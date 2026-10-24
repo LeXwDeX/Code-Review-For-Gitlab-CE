@@ -9,11 +9,13 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -33,9 +35,13 @@ import (
 )
 
 const (
-	defaultCancelPoll     = 2 * time.Second
-	defaultCancelWait     = 45 * time.Second
-	defaultReviewMaxFiles = 200
+	defaultCancelPoll = 2 * time.Second
+	defaultCancelWait = 45 * time.Second
+
+	reviewCancelledReason       = "review cancelled"
+	reviewSupersededReason      = "review superseded"
+	failureNoteDisabledReason   = "failure note disabled"
+	reviewExecutionFailedReason = "review execution failed"
 )
 
 // ReviewStore is the persistence surface needed by review orchestration.
@@ -50,7 +56,8 @@ type ReviewStore interface {
 	GetWorkflow(ctx context.Context, id string) (*store.Workflow, error)
 	GetWorkflowDossier(ctx context.Context, workflowID string) (*store.WorkflowDossier, error)
 	SaveWorkflowDossier(ctx context.Context, dossier store.WorkflowDossier) (*store.WorkflowDossier, error)
-	SetWorkflowPublicationState(ctx context.Context, workflowID, state string) error
+	SetWorkflowPublicationState(ctx context.Context, workflowID, state, reason string) error
+	SetWorkflowPublicationStateIfPending(ctx context.Context, workflowID, reason string) error
 	SetWorkflowVerdict(ctx context.Context, id, verdict string) error
 	ListPendingPublications(ctx context.Context, limit int) ([]store.PendingPublication, error)
 	ListWorkflows(ctx context.Context, filter store.WorkflowFilter, cursor string, limit int) ([]store.Workflow, string, error)
@@ -60,6 +67,7 @@ type ReviewStore interface {
 	UpsertPublication(ctx context.Context, p store.Publication) (*store.Publication, error)
 	ReplaceFindings(ctx context.Context, workflowID string, findings []store.Finding) error
 	ListFindings(ctx context.Context, filter store.FindingFilter) ([]store.Finding, error)
+	HasPublishedSevereFinding(ctx context.Context, projectID, mrIID int64) (bool, error)
 	GetWorkspace(ctx context.Context, projectID int64) (*store.Workspace, error)
 	SaveWorkspace(ctx context.Context, ws store.Workspace) (*store.Workspace, error)
 	GetCurrentContextDoc(ctx context.Context, projectID int64, kind string) (*store.ContextDoc, error)
@@ -91,6 +99,7 @@ type ReviewService struct {
 	cost           review.CostFunc
 	publisher      *Publisher
 	publicURL      string
+	status         *statusReporter
 	logger         *slog.Logger
 	now            func() time.Time
 	cancelPoll     time.Duration
@@ -116,6 +125,7 @@ type ReviewServiceConfig struct {
 	Skills           review.SkillProvider
 	Cost             review.CostFunc
 	Publisher        *Publisher
+	Status           *statusReporter
 	AllowedProviders []string
 	PublicURL        string
 	Logger           *slog.Logger
@@ -173,6 +183,7 @@ func NewReviewService(cfg ReviewServiceConfig) (*ReviewService, error) {
 		providerNames:  cfg.AllowedProviders,
 		publisher:      cfg.Publisher,
 		publicURL:      strings.TrimRight(cfg.PublicURL, "/"),
+		status:         cfg.Status,
 		logger:         logger,
 		now:            now,
 		cancelPoll:     poll,
@@ -206,13 +217,15 @@ func (s *ReviewService) Handle(ctx context.Context, job *jobs.Job) error {
 }
 
 type reviewRunPayload struct {
-	ProjectID  int64  `json:"project_id"`
-	MRIID      int64  `json:"mr_iid"`
-	HeadSHA    string `json:"head_sha"`
-	Generation int64  `json:"generation"`
-	Profile    string `json:"profile"`
-	Trigger    string `json:"trigger"`
-	Full       bool   `json:"full"`
+	ProjectID       int64  `json:"project_id"`
+	MRIID           int64  `json:"mr_iid"`
+	HeadSHA         string `json:"head_sha"`
+	Generation      int64  `json:"generation"`
+	Profile         string `json:"profile"`
+	ProfileExplicit *bool  `json:"profile_explicit,omitempty"`
+	Trigger         string `json:"trigger"`
+	Full            bool   `json:"full"`
+	NoteID          int64  `json:"note_id,omitempty"`
 }
 
 type reviewCancelPayload struct {
@@ -241,10 +254,13 @@ func (s *ReviewService) RunReview(ctx context.Context, job *jobs.Job) error {
 		return err
 	}
 	if payload.ProjectID <= 0 || payload.MRIID <= 0 || payload.Generation <= 0 ||
-		!shaRE.MatchString(payload.HeadSHA) {
+		!shaRE.MatchString(payload.HeadSHA) || payload.NoteID < 0 {
 		return PermanentJob(fmt.Errorf("invalid review.run payload"))
 	}
 	payload.HeadSHA = strings.ToLower(payload.HeadSHA)
+	if strings.TrimSpace(job.ID) == "" {
+		return PermanentJob(fmt.Errorf("review job id is required"))
+	}
 
 	project, token, err := s.projectToken(ctx, payload.ProjectID)
 	if err != nil {
@@ -254,22 +270,51 @@ func (s *ReviewService) RunReview(ctx context.Context, job *jobs.Job) error {
 	if err != nil {
 		return err
 	}
+	// The generation fence passed, so this worker still owns the status note.
+	s.reportStatus(ctx, project, token, control.MRIID, payload.Generation, payload.HeadSHA, reviewStatusUpdate{
+		State:   reviewStatusRunning,
+		HeadSHA: payload.HeadSHA,
+	})
+	// Claim application ownership before preparing a worktree or registering
+	// an executor. A concurrent recovery or lease-reclaimed handler shares the
+	// same job ID and must stop here; Engine.Run's late ErrAlreadyRunning would
+	// let the loser unregister the winner's executor and delete its worktree.
+	if !s.executors.Acquire(job.ID) {
+		return fmt.Errorf("app: review job %s is already owned by another handler", job.ID)
+	}
+	defer s.executors.Release(job.ID)
 	workflow, storedDossier, resumable, err := s.resumableWorkflow(ctx, job.ID, payload.Generation, payload.HeadSHA)
 	if err != nil {
 		return err
 	}
-	if !resumable {
-		if err := s.cancelActive(ctx, control.ProjectID, control.MRIID, payload.Generation); err != nil {
-			return err
-		}
-	}
-
 	inputs, err := s.collectInputs(ctx, project, token, control.MRIID, payload.HeadSHA)
 	if err != nil {
 		return err
 	}
 
 	cfg := s.resolveConfig(project, inputs.RepoDocs)
+	if reason := reviewFilterReason(payload.Trigger, inputs.MR, project, cfg.Settings); reason != "" {
+		// Webhook filtering cannot read repository configuration without a
+		// network call. When repo config is enabled the worker makes the final
+		// decision here, after the target-branch config is merged.
+		s.logger.Info("review job filtered after configuration merge",
+			"project_id", project.ID, "mr_iid", control.MRIID, "trigger", payload.Trigger, "reason", reason)
+		s.reportTerminal(ctx, project, token, control.MRIID, payload.Generation, payload.HeadSHA, reviewStatusUpdate{
+			State:     reviewStatusStale,
+			Detail:    "review skipped: " + reason,
+			HeadSHA:   payload.HeadSHA,
+			NoteID:    payload.NoteID,
+			ClearEyes: true,
+		})
+		return nil
+	}
+	if !resumable {
+		// Filtering happens first so a draft or excluded-label update never
+		// cancels the previous review before the worker knows it is filtered.
+		if err := s.cancelActive(ctx, control.ProjectID, control.MRIID, payload.Generation); err != nil {
+			return err
+		}
+	}
 	configHash := reviewConfigHash(cfg)
 	promptHash := s.prompts.Hash
 	if workflow != nil {
@@ -301,28 +346,28 @@ func (s *ReviewService) RunReview(ctx context.Context, job *jobs.Job) error {
 		}
 	}
 	files, ignored, summary, warnings := buildReviewFiles(inputs.Diffs, cfg.Settings.Ignore, cfg.Settings.MaxFiles, cfg.Settings.MaxDiffLines)
+	cfg.Warnings = append(cfg.Warnings, warnings...)
 	if len(files) == 0 {
 		// Everything is ignored: publish an informational summary without a
 		// workflow. Re-check the generation because collection takes time.
 		if _, err := s.currentControl(ctx, project.ID, control.MRIID, payload.Generation, payload.HeadSHA); err != nil {
 			return err
 		}
-		return s.publishEmpty(ctx, project, token, control, inputs, cfg)
+		return s.publishEmptyWithNote(ctx, project, token, control, payload.NoteID, inputs, cfg, summary, ignored)
 	}
-	cfg.Warnings = append(cfg.Warnings, warnings...)
-
 	head, cleanup, err := s.prepareRun(ctx, project, token, control.MRIID, job.ID, payload.HeadSHA)
 	if err != nil {
 		return err
 	}
 	defer cleanup()
 
-	profileName, profileCfg := s.profileFor(project, payload.Profile, cfg.Profile, inputs.MR.Labels)
+	profileName, profileCfg := s.profileFor(project, payload.Profile, cfg.Profile, inputs.MR.Labels, profileExplicit(payload))
 	profile := review.Profile{Name: profileName, Config: profileCfg}
 	contextDoc := s.contextDoc(ctx, project.ID)
 
 	trigger := payload.Trigger
-	if trigger == "" {
+	if trigger == "" || trigger == "manual" {
+		// "manual" is an ingress-only marker; persisted workflows use "api".
 		trigger = "api"
 	}
 	incremental := s.incrementalRange(ctx, project.ID, payload, control, payload.HeadSHA, files)
@@ -342,6 +387,7 @@ func (s *ReviewService) RunReview(ctx context.Context, job *jobs.Job) error {
 		Issues:      inputs.Issues,
 		RepoDocs:    inputs.RepoDocs,
 		ContextDocs: contextDoc,
+		Language:    cfg.Settings.Language,
 		CustomRules: cfg.Settings.CustomRules,
 		Incremental: incremental,
 		HeadDir:     head,
@@ -351,6 +397,7 @@ func (s *ReviewService) RunReview(ctx context.Context, job *jobs.Job) error {
 			"base_sha":    inputs.Version.BaseSHA,
 			"config_hash": configHash,
 			"prompt_hash": promptHash,
+			"note_id":     itoa(payload.NoteID),
 		},
 		GeneratedAt: s.now().UTC(),
 	})
@@ -397,13 +444,18 @@ func (s *ReviewService) RunReview(ctx context.Context, job *jobs.Job) error {
 			s.logger.Info("review workflow superseded before creation", "project_id", project.ID, "mr_iid", payload.MRIID)
 			return nil
 		}
+		if errors.Is(err, store.ErrIncompleteWorkflow) {
+			return PermanentJob(fmt.Errorf("resume review workflow: %w", err))
+		}
 		return err
 	}
 
 	// A push may land between CreateReviewWorkflow and the event append.
 	if _, err := s.currentControl(ctx, project.ID, control.MRIID, payload.Generation, payload.HeadSHA); err != nil {
 		if IsPermanentJob(err) {
-			_ = s.engine.Cancel(context.WithoutCancel(ctx), wfID, "superseded")
+			if cancelErr := s.engine.Cancel(context.WithoutCancel(ctx), wfID, "superseded"); cancelErr != nil && !errors.Is(cancelErr, dag.ErrNotFound) {
+				s.logger.Warn("cancel superseded workflow failed", "workflow_id", wfID, "error", cancelErr.Error())
+			}
 			return nil
 		}
 		return err
@@ -448,7 +500,8 @@ func (s *ReviewService) RunReview(ctx context.Context, job *jobs.Job) error {
 	}
 	if superseded {
 		s.logger.Info("review superseded while running", "workflow_id", wfID)
-		return nil
+		s.reportSuperseded(ctx, project, token, control.MRIID, payload.Generation, payload.HeadSHA, wfID)
+		return s.skipPublication(ctx, wfID, reviewSupersededReason)
 	}
 
 	snapshot, err := s.engine.Snapshot(ctx, wfID)
@@ -457,12 +510,46 @@ func (s *ReviewService) RunReview(ctx context.Context, job *jobs.Job) error {
 	}
 	switch snapshot.Status {
 	case dag.WorkflowCompleted:
-		return s.publish(ctx, wfID)
-	case dag.WorkflowFailed:
-		if cfg.Settings.PostFailureNote {
-			return s.publishFailure(ctx, wfID, snapshot)
+		s.reportStatus(ctx, project, token, control.MRIID, payload.Generation, payload.HeadSHA, reviewStatusUpdate{
+			State:   reviewStatusPublishing,
+			HeadSHA: payload.HeadSHA,
+			NoteID:  payload.NoteID,
+		})
+		if err := s.publish(ctx, wfID); err != nil {
+			s.reportPublishFailure(ctx, project, token, control.MRIID, payload.Generation, payload.HeadSHA, payload.NoteID, err)
+			return err
 		}
+		s.reportVerdict(ctx, project, token, control.MRIID, payload.Generation, payload.HeadSHA, payload.NoteID, wfID)
 		return nil
+	case dag.WorkflowFailed:
+		s.reportStatus(ctx, project, token, control.MRIID, payload.Generation, payload.HeadSHA, reviewStatusUpdate{
+			State:   reviewStatusPublishing,
+			HeadSHA: payload.HeadSHA,
+			NoteID:  payload.NoteID,
+		})
+		var publishErr error
+		if cfg.Settings.PostFailureNote {
+			publishErr = s.publishFailure(ctx, wfID, snapshot)
+		} else {
+			publishErr = s.skipPublication(ctx, wfID, failureNoteDisabledReason)
+		}
+		s.reportTerminal(ctx, project, token, control.MRIID, payload.Generation, payload.HeadSHA, reviewStatusUpdate{
+			State:     reviewStatusFailed,
+			HeadSHA:   payload.HeadSHA,
+			NoteID:    payload.NoteID,
+			Reaction:  reviewAwardFail,
+			ClearEyes: true,
+		})
+		return publishErr
+	case dag.WorkflowCancelled:
+		publishErr := s.skipPublication(ctx, wfID, reviewCancelledReason)
+		s.reportTerminal(ctx, project, token, control.MRIID, payload.Generation, payload.HeadSHA, reviewStatusUpdate{
+			State:     reviewStatusCancelled,
+			HeadSHA:   payload.HeadSHA,
+			NoteID:    payload.NoteID,
+			ClearEyes: true,
+		})
+		return publishErr
 	default:
 		return nil
 	}
@@ -488,23 +575,62 @@ func (s *ReviewService) CancelReview(ctx context.Context, job *jobs.Job) error {
 		// A newer review.run replaced this cancel; do not touch it.
 		return nil
 	}
+	if payload.Generation > 0 && control.Generation != payload.Generation {
+		return nil
+	}
 	active, err := s.store.FindActiveReview(ctx, payload.ProjectID, payload.MRIID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			// The review was still queued; there is no workflow to cancel, but
+			// the status note still needs its terminal state.
+			s.reportCancelled(ctx, payload.ProjectID, payload.MRIID, payload.Generation, "")
+			return nil
+		}
+		return err
+	}
+	// The active workflow may belong to a newer generation when a push lands
+	// between the control read and this lookup. Never cancel it.
+	if payload.Generation > 0 {
+		dossier, err := s.store.GetWorkflowDossier(ctx, active.ID)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				// A workflow without its dossier cannot be validated or
+				// repaired by a retry, so settle the job instead of looping.
+				return PermanentJob(fmt.Errorf("%w: workflow %s", store.ErrIncompleteWorkflow, active.ID))
+			}
+			return err
+		}
+		if dossier.Generation > payload.Generation {
+			// A newer review already owns the MR. Never cancel it, but report
+			// the superseded result instead of silently succeeding.
+			return PermanentJob(fmt.Errorf("%w: workflow %s generation %d is newer than cancel generation %d",
+				ErrReviewSuperseded, active.ID, dossier.Generation, payload.Generation))
+		}
+	}
+	control, err = s.store.GetReviewControl(ctx, payload.ProjectID, payload.MRIID)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return nil
 		}
 		return err
 	}
+	if !control.Cancelled || (payload.Generation > 0 && control.Generation != payload.Generation) {
+		return nil
+	}
 	if err := s.engine.Cancel(ctx, active.ID, "user_cancelled"); err != nil {
 		if errors.Is(err, dag.ErrNotFound) {
-			return nil
+			publishErr := s.skipPublication(ctx, active.ID, reviewCancelledReason)
+			s.reportCancelled(ctx, payload.ProjectID, payload.MRIID, payload.Generation, active.ID)
+			return publishErr
 		}
 		return err
 	}
 	if err := s.waitTerminal(ctx, active.ID); err != nil {
 		return err
 	}
-	return nil
+	publishErr := s.skipPublication(ctx, active.ID, reviewCancelledReason)
+	s.reportCancelled(ctx, payload.ProjectID, payload.MRIID, payload.Generation, active.ID)
+	return publishErr
 }
 
 // RepublishReview executes one review.publish job. It delegates to the
@@ -609,7 +735,7 @@ func (s *ReviewService) currentControl(ctx context.Context, projectID, mrIID, ge
 		}
 		return nil, err
 	}
-	if control.Cancelled || control.Generation != generation || control.HeadSHA != head {
+	if control.Cancelled || control.Generation != generation || !strings.EqualFold(control.HeadSHA, head) {
 		return nil, PermanentJob(fmt.Errorf("%w: generation %d head %s is not current", ErrReviewSuperseded, generation, head))
 	}
 	return control, nil
@@ -650,21 +776,36 @@ func (s *ReviewService) cancelActive(ctx context.Context, projectID, mrIID, gene
 	return s.cancelWorkflow(ctx, active.ID)
 }
 
-// cancelWorkflow cancels one workflow and waits for its durable terminal state.
+// cancelWorkflow cancels one workflow, waits for its durable terminal state,
+// and settles publication as skipped. A superseded review must never keep an
+// SSE stream waiting on a publication that will not happen.
 func (s *ReviewService) cancelWorkflow(ctx context.Context, workflowID string) error {
 	if err := s.engine.Cancel(ctx, workflowID, "superseded"); err != nil {
 		if errors.Is(err, dag.ErrNotFound) {
-			return nil
+			return s.skipPublication(ctx, workflowID, reviewSupersededReason)
 		}
 		return err
 	}
 	if err := s.waitTerminal(ctx, workflowID); err != nil {
 		if errors.Is(err, dag.ErrNotFound) {
-			return nil
+			return s.skipPublication(ctx, workflowID, reviewSupersededReason)
 		}
 		return err
 	}
-	return nil
+	return s.skipPublication(ctx, workflowID, reviewSupersededReason)
+}
+
+// skipPublication settles a pending publication without publishing. The CAS
+// never overwrites a published or failed result. Cleanup uses a detached
+// context so a cancelled run still records its terminal publication state.
+func (s *ReviewService) skipPublication(ctx context.Context, workflowID, reason string) error {
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	err := s.store.SetWorkflowPublicationStateIfPending(writeCtx, workflowID, reason)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil
+	}
+	return err
 }
 
 func (s *ReviewService) waitTerminal(ctx context.Context, workflowID string) error {
@@ -748,20 +889,171 @@ func (s *ReviewService) publishFailure(ctx context.Context, workflowID string, s
 	return s.publisher.PublishFailure(ctx, workflowID, failureReason(snapshot))
 }
 
+// failureReason returns a safe, bounded reason for a published failure note.
+// Raw node and workflow errors stay in logs; they can contain upstream text or
+// credentials and must not reach the merge request.
 func failureReason(snapshot dag.WorkflowView) string {
 	for _, id := range snapshot.Order {
 		node := snapshot.Nodes[id]
 		if node.Status == dag.NodeFailed {
-			if strings.TrimSpace(node.Error) != "" {
-				return truncateRunes(node.Error, 500)
-			}
-			return "node " + id + " failed"
+			return "node " + truncateRunes(id, 64) + " failed"
 		}
 	}
-	if strings.TrimSpace(snapshot.Error) != "" {
-		return truncateRunes(snapshot.Error, 500)
+	return reviewExecutionFailedReason
+}
+
+// reportStatus writes one best-effort status while this worker's generation
+// still owns the MR. Every failure is logged inside the reporter and never
+// changes the review outcome.
+func (s *ReviewService) reportStatus(ctx context.Context, project *store.Project, token string, mrIID, generation int64, head string, update reviewStatusUpdate) {
+	if s.status == nil || project == nil {
+		return
 	}
-	return "workflow failed"
+	if _, err := s.currentControl(ctx, project.ID, mrIID, generation, head); err != nil {
+		return
+	}
+	s.status.report(ctx, project.ID, mrIID, token, update)
+}
+
+// reportTerminal writes a terminal status after a fresh control read. A stale
+// worker never replaces the status note owned by a successor generation.
+func (s *ReviewService) reportTerminal(ctx context.Context, project *store.Project, token string, mrIID, generation int64, head string, update reviewStatusUpdate) {
+	if s.status == nil || project == nil {
+		return
+	}
+	control, err := s.store.GetReviewControl(ctx, project.ID, mrIID)
+	if err != nil {
+		return
+	}
+	if control.Generation != generation || !strings.EqualFold(control.HeadSHA, head) {
+		return
+	}
+	if control.Cancelled && update.State != reviewStatusCancelled && update.State != reviewStatusStale {
+		return
+	}
+	s.status.report(ctx, project.ID, mrIID, token, update)
+}
+
+// reportSuperseded writes the terminal state when no successor generation has
+// claimed the MR. A successor owns its own status note and is left untouched.
+func (s *ReviewService) reportSuperseded(ctx context.Context, project *store.Project, token string, mrIID, generation int64, head, workflowID string) {
+	if s.status == nil || project == nil {
+		return
+	}
+	control, err := s.store.GetReviewControl(ctx, project.ID, mrIID)
+	if err != nil || control.Generation != generation {
+		return
+	}
+	state := reviewStatusStale
+	detail := "merge request changed before publication"
+	if control.Cancelled {
+		state = reviewStatusCancelled
+		detail = "review cancelled"
+	}
+	s.status.report(ctx, project.ID, mrIID, token, reviewStatusUpdate{
+		State:     state,
+		Detail:    detail,
+		HeadSHA:   head,
+		NoteID:    s.workflowNoteID(ctx, workflowID),
+		ClearEyes: true,
+	})
+}
+
+func (s *ReviewService) reportPublishFailure(ctx context.Context, project *store.Project, token string, mrIID, generation int64, head string, noteID int64, cause error) {
+	state := reviewStatusFailed
+	reaction := reviewAwardFail
+	detail := "publication failed"
+	if errors.Is(cause, ErrStalePublication) {
+		state = reviewStatusStale
+		reaction = ""
+		detail = "review is no longer current"
+	}
+	s.reportTerminal(ctx, project, token, mrIID, generation, head, reviewStatusUpdate{
+		State:     state,
+		Detail:    detail,
+		HeadSHA:   head,
+		NoteID:    noteID,
+		Reaction:  reaction,
+		ClearEyes: true,
+	})
+}
+
+func (s *ReviewService) reportVerdict(ctx context.Context, project *store.Project, token string, mrIID, generation int64, head string, noteID int64, workflowID string) {
+	state, reaction := reviewStatusForVerdict(s.workflowVerdict(ctx, workflowID))
+	s.reportTerminal(ctx, project, token, mrIID, generation, head, reviewStatusUpdate{
+		State:     state,
+		HeadSHA:   head,
+		NoteID:    noteID,
+		Reaction:  reaction,
+		ClearEyes: true,
+	})
+}
+
+func (s *ReviewService) workflowVerdict(ctx context.Context, workflowID string) string {
+	workflow, err := s.store.GetWorkflow(ctx, workflowID)
+	if err != nil || workflow == nil {
+		return ""
+	}
+	return workflow.Verdict
+}
+
+// workflowNoteID reads the command source note from the persisted dossier so a
+// retried or recovered workflow can still settle its reaction.
+func (s *ReviewService) workflowNoteID(ctx context.Context, workflowID string) int64 {
+	if strings.TrimSpace(workflowID) == "" {
+		return 0
+	}
+	record, err := s.store.GetWorkflowDossier(ctx, workflowID)
+	if err != nil || len(record.Data) == 0 {
+		return 0
+	}
+	var dossier review.Dossier
+	if err := json.Unmarshal(record.Data, &dossier); err != nil {
+		return 0
+	}
+	return dossierNoteID(dossier)
+}
+
+func dossierNoteID(dossier review.Dossier) int64 {
+	value, err := strconv.ParseInt(strings.TrimSpace(dossier.Metadata["note_id"]), 10, 64)
+	if err != nil || value <= 0 {
+		return 0
+	}
+	return value
+}
+
+// reportCancelled settles the status for a confirmed user cancellation. The
+// control is read again so a newer generation that replaced the cancel is not
+// overwritten.
+func (s *ReviewService) reportCancelled(ctx context.Context, projectID, mrIID, generation int64, workflowID string) {
+	if s.status == nil || generation <= 0 {
+		return
+	}
+	control, err := s.store.GetReviewControl(ctx, projectID, mrIID)
+	if err != nil || !control.Cancelled || control.Generation != generation {
+		return
+	}
+	project, token, err := s.projectToken(ctx, projectID)
+	if err != nil {
+		return
+	}
+	s.status.report(ctx, project.ID, mrIID, token, reviewStatusUpdate{
+		State:     reviewStatusCancelled,
+		Detail:    "review cancelled",
+		NoteID:    s.workflowNoteID(ctx, workflowID),
+		ClearEyes: true,
+	})
+}
+
+func reviewStatusForVerdict(verdict string) (string, string) {
+	switch verdict {
+	case review.VerdictPass:
+		return reviewStatusPass, reviewAwardPass
+	case review.VerdictBlocking:
+		return reviewStatusBlocking, reviewAwardFail
+	default:
+		return reviewStatusIncomplete, reviewAwardFail
+	}
 }
 
 // reviewInputs is the sanitized GitLab input for one review.
@@ -809,12 +1101,31 @@ func (s *ReviewService) collectInputs(ctx context.Context, project *store.Projec
 	inputs := &reviewInputs{MR: mr, Version: version, Diffs: diffs}
 	inputs.Pipeline = s.collectPipeline(ctx, token, project.ID, mrIID)
 	inputs.Issues = s.collectIssues(ctx, token, project.ID, mrIID)
-	inputs.RepoDocs = review.RepoDocs{
-		GitLabReviewConfig: s.rawDoc(ctx, token, project.ID, ".gitlab-review.yml", mr.TargetBranch),
-		AGENTS:             s.rawDoc(ctx, token, project.ID, "AGENTS.md", mr.TargetBranch),
-		CLAUDE:             s.rawDoc(ctx, token, project.ID, "CLAUDE.md", mr.TargetBranch),
+	docs, err := s.repoDocs(ctx, token, project.ID, mr.TargetBranch)
+	if err != nil {
+		return nil, err
 	}
+	inputs.RepoDocs = docs
 	return inputs, nil
+}
+
+// repoDocs reads the target-branch documents used by review and publication.
+// A missing file is an empty document; every other error is retryable so a
+// transient upstream failure never changes the configuration fingerprint.
+func (s *ReviewService) repoDocs(ctx context.Context, token string, projectID int64, ref string) (review.RepoDocs, error) {
+	configDoc, err := s.rawDoc(ctx, token, projectID, ".gitlab-review.yml", ref)
+	if err != nil {
+		return review.RepoDocs{}, err
+	}
+	agents, err := s.rawDoc(ctx, token, projectID, "AGENTS.md", ref)
+	if err != nil {
+		return review.RepoDocs{}, err
+	}
+	claude, err := s.rawDoc(ctx, token, projectID, "CLAUDE.md", ref)
+	if err != nil {
+		return review.RepoDocs{}, err
+	}
+	return review.RepoDocs{GitLabReviewConfig: configDoc, AGENTS: agents, CLAUDE: claude}, nil
 }
 
 func mrState(mr *gitlab.MergeRequest) string {
@@ -887,15 +1198,16 @@ func (s *ReviewService) collectIssues(ctx context.Context, token string, project
 	return out
 }
 
-func (s *ReviewService) rawDoc(ctx context.Context, token string, projectID int64, path, ref string) string {
+func (s *ReviewService) rawDoc(ctx context.Context, token string, projectID int64, path, ref string) (string, error) {
 	data, err := s.gitlab.GetRawFile(ctx, token, projectID, path, ref)
 	if err != nil {
 		if !gitlab.IsNotFound(err) {
 			s.logger.Warn("repository document lookup failed", "project_id", projectID, "path", path)
+			return "", err
 		}
-		return ""
+		return "", nil
 	}
-	return string(data)
+	return string(data), nil
 }
 
 func mrMeta(mr *gitlab.MergeRequest) review.MRMeta {
@@ -948,8 +1260,9 @@ func resolveReviewConfig(project *store.Project, docs review.RepoDocs, defaults 
 	}
 	// Normalize once so the review service and publisher hash the same value.
 	if out.Settings.MaxFiles <= 0 {
-		out.Settings.MaxFiles = defaultReviewMaxFiles
+		out.Settings.MaxFiles = review.DefaultMaxFiles
 	}
+	out.Settings.Language = strings.Join(strings.Fields(out.Settings.Language), " ")
 	if !out.Settings.AllowRepoConfig || strings.TrimSpace(docs.GitLabReviewConfig) == "" {
 		return out
 	}
@@ -958,8 +1271,13 @@ func resolveReviewConfig(project *store.Project, docs review.RepoDocs, defaults 
 		out.Warnings = append(out.Warnings, ".gitlab-review.yml is invalid and was ignored")
 		return out
 	}
-	if strings.TrimSpace(repo.Language) != "" {
-		out.Settings.Language = repo.Language
+	out.Warnings = append(out.Warnings, repoReviewConfigWarnings(docs.GitLabReviewConfig)...)
+	if language := strings.Join(strings.Fields(repo.Language), " "); language != "" {
+		if len([]rune(language)) > 128 {
+			out.Warnings = append(out.Warnings, ".gitlab-review.yml: language is too long and was ignored")
+		} else {
+			out.Settings.Language = language
+		}
 	}
 	if strings.TrimSpace(repo.Profile) != "" {
 		if _, ok := profiles[repo.Profile]; ok {
@@ -973,8 +1291,100 @@ func resolveReviewConfig(project *store.Project, docs review.RepoDocs, defaults 
 	if repo.Review.SkipDraft != nil {
 		out.Settings.SkipDraft = *repo.Review.SkipDraft
 	}
-	out.Settings.LabelsExclude = appendUnique(out.Settings.LabelsExclude, repo.Review.LabelsExclude)
+	labels := make([]string, 0, len(repo.Review.LabelsExclude))
+	for _, label := range repo.Review.LabelsExclude {
+		if strings.TrimSpace(label) == "" {
+			out.Warnings = append(out.Warnings, ".gitlab-review.yml: empty review.labels_exclude entry ignored")
+			continue
+		}
+		labels = append(labels, label)
+	}
+	out.Settings.LabelsExclude = appendUnique(out.Settings.LabelsExclude, labels)
 	return out
+}
+
+// repoReviewConfigWarnings reports fields outside the repository whitelist.
+// They stay unapplied; the warning is surfaced in the published summary.
+func repoReviewConfigWarnings(raw string) []string {
+	var doc yaml.Node
+	if err := yaml.Unmarshal([]byte(raw), &doc); err != nil || len(doc.Content) == 0 {
+		return nil
+	}
+	root := doc.Content[0]
+	if root.Kind != yaml.MappingNode {
+		return nil
+	}
+	var warnings []string
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		key := root.Content[i].Value
+		switch key {
+		case "version", "language", "profile", "ignore", "rules":
+		case "review":
+			review := root.Content[i+1]
+			if review.Kind != yaml.MappingNode {
+				continue
+			}
+			for j := 0; j+1 < len(review.Content); j += 2 {
+				switch review.Content[j].Value {
+				case "skip_draft", "labels_exclude":
+				default:
+					warnings = append(warnings, fmt.Sprintf(".gitlab-review.yml: unknown field review.%s ignored", review.Content[j].Value))
+				}
+			}
+		default:
+			warnings = append(warnings, fmt.Sprintf(".gitlab-review.yml: unknown field %s ignored", key))
+		}
+	}
+	return warnings
+}
+
+// profileExplicit distinguishes an operator-selected profile from the
+// automatic webhook default. Legacy queued command/manual payloads carry no
+// explicit flag, so their trigger remains the only available evidence.
+func profileExplicit(payload reviewRunPayload) bool {
+	if payload.ProfileExplicit != nil {
+		return *payload.ProfileExplicit
+	}
+	switch payload.Trigger {
+	case "command", "manual":
+		return true
+	default:
+		return false
+	}
+}
+
+// reviewFilterReason applies draft, label, and branch filters to automatic
+// triggers only. Manual commands keep their existing bypass semantics.
+func reviewFilterReason(trigger string, mr *gitlab.MergeRequest, project *store.Project, settings config.ProjectSettings) string {
+	switch trigger {
+	case "mr_open", "mr_update":
+	default:
+		return ""
+	}
+	if mr == nil {
+		return ""
+	}
+	if settings.SkipDraft && mergeRequestDraft(mr) {
+		return "draft"
+	}
+	if !LabelsAllowed(mr.Labels, settings.LabelsInclude, settings.LabelsExclude) {
+		return "labels_filtered"
+	}
+	if !BranchAllowed(mr.TargetBranch, project.DefaultBranch, settings.TargetBranches) {
+		return "branch_filtered"
+	}
+	return ""
+}
+
+func mergeRequestDraft(mr *gitlab.MergeRequest) bool {
+	if mr == nil {
+		return false
+	}
+	if mr.Draft {
+		return true
+	}
+	title := strings.ToLower(strings.TrimSpace(mr.Title))
+	return strings.HasPrefix(title, "draft:") || strings.HasPrefix(title, "wip:")
 }
 
 func reviewConfigHash(cfg effectiveReviewConfig) string {
@@ -997,10 +1407,12 @@ func reviewFingerprint(dossierHash, configHash, promptHash string) string {
 	return sha256Hex(dossierHash + "\n" + configHash + "\n" + promptHash)
 }
 
-func (s *ReviewService) profileFor(project *store.Project, requested, repoProfile string, labels []string) (string, config.ProfileConfig) {
-	candidates := []string{requested}
-	if strings.TrimSpace(requested) == "" {
-		candidates = append(candidates, repoProfile)
+func (s *ReviewService) profileFor(project *store.Project, requested, repoProfile string, labels []string, explicit bool) (string, config.ProfileConfig) {
+	var candidates []string
+	if explicit {
+		candidates = []string{requested, repoProfile}
+	} else {
+		candidates = []string{repoProfile, requested}
 	}
 	candidates = append(candidates, ProfileForLabels(labels, project.Profile, s.reviewDefaults), "default")
 	seen := make(map[string]struct{}, len(candidates))
@@ -1041,6 +1453,15 @@ func (s *ReviewService) incrementalRange(ctx context.Context, projectID int64, p
 	if err != nil || last == "" || strings.EqualFold(last, head) {
 		return &review.IncrementalRange{Head: head, Full: true, Reason: "no previous reviewed head"}
 	}
+	// A previous published P0/P1 may live in a file this push did not touch.
+	// The incremental scope cannot recheck it, so fall back to the full MR.
+	severe, err := s.store.HasPublishedSevereFinding(ctx, projectID, control.MRIID)
+	if err != nil {
+		return &review.IncrementalRange{Head: head, LastHead: last, Full: true, Reason: "previous finding lookup failed"}
+	}
+	if severe {
+		return &review.IncrementalRange{Head: head, LastHead: last, Full: true, Reason: "previous severe finding was not rechecked"}
+	}
 	ws := s.workspace.Get(projectID)
 	if ws == nil {
 		return nil
@@ -1065,6 +1486,9 @@ func (s *ReviewService) incrementalRange(ctx context.Context, projectID int64, p
 	})
 	if err != nil {
 		return &review.IncrementalRange{Head: head, LastHead: last, Full: true, Reason: "incremental scope failed"}
+	}
+	if len(scope.Files) == 0 {
+		return &review.IncrementalRange{Head: head, LastHead: last, Full: true, Reason: "empty incremental scope"}
 	}
 	return &review.IncrementalRange{
 		LastHead: last,
@@ -1096,6 +1520,9 @@ func (s *ReviewService) prepareRun(ctx context.Context, project *store.Project, 
 	remote := trimProjectWebURL(project.WebURL)
 	if remote == "" {
 		return fail(PermanentJob(fmt.Errorf("project web url is empty")))
+	}
+	if err := ensureReviewRoot(ws.Root); err != nil {
+		return fail(err)
 	}
 	auth := repo.Auth{Token: token}
 	if err := s.git.EnsureMirror(ctx, ws.MirrorDir(), remote, auth); err != nil {
@@ -1159,27 +1586,139 @@ func (s *ReviewService) prepareRun(ctx context.Context, project *store.Project, 
 	return runDir, cleanup, nil
 }
 
+// ensureReviewRoot creates the project workspace root and rejects a symlinked
+// root or parent before a git or worktree write can follow it. Deeper
+// configured ancestors are trusted.
+func ensureReviewRoot(root string) error {
+	if !filepath.IsAbs(root) {
+		return fmt.Errorf("app: workspace root is not absolute")
+	}
+	info, err := os.Lstat(root)
+	switch {
+	case err == nil:
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return fmt.Errorf("app: workspace root is unsafe")
+		}
+	case !errors.Is(err, os.ErrNotExist):
+		return fmt.Errorf("app: inspect workspace root: %w", err)
+	}
+	parent := filepath.Dir(root)
+	parentInfo, err := os.Lstat(parent)
+	switch {
+	case err == nil:
+		if parentInfo.Mode()&os.ModeSymlink != 0 || !parentInfo.IsDir() {
+			return fmt.Errorf("app: workspace parent is unsafe")
+		}
+	case errors.Is(err, os.ErrNotExist):
+		if err := os.MkdirAll(parent, 0o700); err != nil {
+			return fmt.Errorf("app: create workspace parent: %w", err)
+		}
+		parentInfo, err = os.Lstat(parent)
+		if err != nil || parentInfo.Mode()&os.ModeSymlink != 0 || !parentInfo.IsDir() {
+			return fmt.Errorf("app: workspace parent is unsafe")
+		}
+	default:
+		return fmt.Errorf("app: inspect workspace parent: %w", err)
+	}
+	if err := os.Mkdir(root, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+		return fmt.Errorf("app: create workspace root: %w", err)
+	}
+	info, err = os.Lstat(root)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return fmt.Errorf("app: workspace root is unsafe")
+	}
+	return nil
+}
+
 // publishEmpty publishes the "nothing to review" summary without a workflow.
-func (s *ReviewService) publishEmpty(ctx context.Context, project *store.Project, token string, control *store.ReviewControl, inputs *reviewInputs, cfg effectiveReviewConfig) error {
+func (s *ReviewService) publishEmpty(ctx context.Context, project *store.Project, token string, control *store.ReviewControl, inputs *reviewInputs, cfg effectiveReviewConfig, summary review.DiffSummary, ignored []string) error {
+	return s.publishEmptyWithNote(ctx, project, token, control, 0, inputs, cfg, summary, ignored)
+}
+
+func (s *ReviewService) publishEmptyWithNote(ctx context.Context, project *store.Project, token string, control *store.ReviewControl, noteID int64, inputs *reviewInputs, cfg effectiveReviewConfig, summary review.DiffSummary, ignored []string) error {
+	if inputs == nil || inputs.MR == nil || inputs.Version == nil {
+		return PermanentJob(errors.New("app: publish empty summary: incomplete review inputs"))
+	}
 	if s.publisher == nil {
 		return errors.New("app: review publisher is not configured")
 	}
-	profileName, _ := s.profileFor(project, "", cfg.Profile, inputs.MR.Labels)
+	recheck := func() error {
+		_, err := s.currentControl(ctx, project.ID, control.MRIID, control.Generation, inputs.Version.HeadSHA)
+		return err
+	}
+	if err := recheck(); err != nil {
+		return err
+	}
+	s.reportStatus(ctx, project, token, control.MRIID, control.Generation, inputs.Version.HeadSHA, reviewStatusUpdate{
+		State:   reviewStatusPublishing,
+		HeadSHA: inputs.Version.HeadSHA,
+		NoteID:  noteID,
+	})
+	profileName, _ := s.profileFor(project, "", cfg.Profile, inputs.MR.Labels, false)
 	fingerprint := sha256Hex(strings.Join([]string{
 		inputs.Version.HeadSHA, reviewConfigHash(cfg), profileName,
 	}, "\n"))
-	body, err := review.RenderSummary(review.SummaryInput{
+	summaryInput := review.SummaryInput{
 		Verdict:     review.VerdictPass,
 		Summary:     "无需评审：所有变更文件均被忽略规则过滤。",
 		Fingerprint: fingerprint,
 		HeadSHA:     inputs.Version.HeadSHA,
 		Profile:     profileName,
 		Warnings:    append(cfg.Warnings, "no reviewable files after ignore rules"),
-	})
+	}
+	if summary.Truncated || len(summary.Omitted) > 0 {
+		total := summary.Total
+		if total == 0 {
+			total = summary.Files + len(summary.Omitted) + len(inputs.Diffs)
+		}
+		reason := fmt.Sprintf("omitted %d of %d changed file(s) (included=%d, ignored=%d)",
+			len(summary.Omitted), total, summary.Files, len(ignored))
+		if len(summary.Omitted) > 0 {
+			reason += " before review:" + omittedPathList(summary.Omitted, 4)
+			reasons := make(map[string]int, len(summary.Omitted))
+			for _, omitted := range summary.Omitted {
+				reasons[omitted.Reason]++
+			}
+			parts := make([]string, 0, len(reasons))
+			for name, count := range reasons {
+				parts = append(parts, fmt.Sprintf("%s=%d", name, count))
+			}
+			sort.Strings(parts)
+			reason += "; reasons: " + strings.Join(parts, ", ")
+		} else {
+			reason += "; omitted paths were not recorded in this older snapshot"
+		}
+		summaryInput.Verdict = review.VerdictIncomplete
+		summaryInput.Summary = "没有可评审的文件：材料快照遗漏了变更文件。"
+		summaryInput.IncompleteReason = reason
+		summaryInput.Warnings = append(cfg.Warnings,
+			fmt.Sprintf("no reviewable files: %d changed file(s) omitted before review", len(summary.Omitted)))
+	}
+	body, err := review.RenderSummary(summaryInput)
 	if err != nil {
 		return PermanentJob(fmt.Errorf("render empty summary: %w", err))
 	}
-	return s.publisher.PublishStandaloneSummary(ctx, project.ID, control.MRIID, token, fingerprint, body)
+	// A push can land while the summary is rendered; never publish stale text.
+	if err := recheck(); err != nil {
+		return err
+	}
+	// A push can still land between this recheck and the summary upsert below.
+	// That window is accepted: the summary marker keys the publication, so a
+	// late write is replaced by the next review instead of creating a second
+	// summary.
+	if err := s.publisher.PublishStandaloneSummary(ctx, project.ID, control.MRIID, token, fingerprint, body); err != nil {
+		s.reportPublishFailure(ctx, project, token, control.MRIID, control.Generation, inputs.Version.HeadSHA, noteID, err)
+		return err
+	}
+	state, reaction := reviewStatusForVerdict(summaryInput.Verdict)
+	s.reportTerminal(ctx, project, token, control.MRIID, control.Generation, inputs.Version.HeadSHA, reviewStatusUpdate{
+		State:     state,
+		HeadSHA:   inputs.Version.HeadSHA,
+		NoteID:    noteID,
+		Reaction:  reaction,
+		ClearEyes: true,
+	})
+	return nil
 }
 
 func sha256Hex(value string) string {
@@ -1284,15 +1823,24 @@ func buildReviewFiles(diffs []gitlab.FileDiff, ignores []string, maxFiles, maxDi
 	files := make([]review.FileChange, 0, len(diffs))
 	ignored := make([]string, 0)
 	warnings := make([]string, 0)
-	summary := review.DiffSummary{}
+	summary := review.DiffSummary{Total: len(diffs)}
 	lines := 0
+	omittedByFiles := 0
+	omittedByLines := 0
+	omit := func(filePath, reason string) {
+		summary.Truncated = true
+		summary.Omitted = append(summary.Omitted, review.OmittedFile{Path: filePath, Reason: reason})
+	}
 	for _, diff := range diffs {
 		filePath := strings.TrimSpace(diff.NewPath)
 		if filePath == "" {
 			filePath = strings.TrimSpace(diff.OldPath)
 		}
 		if !validRepoPath(filePath) {
-			warnings = append(warnings, "skipped a changed file with an invalid path")
+			label := invalidPathLabel(filePath)
+			omit(label, "invalid_path")
+			warnings = append(warnings, fmt.Sprintf(
+				"review coverage gap: skipped a changed file with an invalid path (%s)", label))
 			continue
 		}
 		if matcher.Match(filePath) {
@@ -1300,12 +1848,26 @@ func buildReviewFiles(diffs []gitlab.FileDiff, ignores []string, maxFiles, maxDi
 			continue
 		}
 		if maxFiles > 0 && len(files) >= maxFiles {
-			summary.Truncated = true
+			omittedByFiles++
+			omit(filePath, "max_files")
+			continue
+		}
+		if diff.TooLarge || diff.Collapsed {
+			// GitLab withheld the body. Record the path and reason so the
+			// coverage gap is visible; never present it as reviewed content.
+			cause := "too_large"
+			if diff.Collapsed {
+				cause = "collapsed"
+			}
+			omit(filePath, cause)
+			warnings = append(warnings, fmt.Sprintf(
+				"review coverage gap: GitLab did not provide a diff for %s (%s)", filePath, cause))
 			continue
 		}
 		additions, deletions := countDiffLines(diff.Diff)
 		if maxDiffLines > 0 && lines > 0 && lines+additions+deletions > maxDiffLines {
-			summary.Truncated = true
+			omittedByLines++
+			omit(filePath, "max_diff_lines")
 			continue
 		}
 		status := "modified"
@@ -1335,8 +1897,53 @@ func buildReviewFiles(diffs []gitlab.FileDiff, ignores []string, maxFiles, maxDi
 		summary.Additions += additions
 		summary.Deletions += deletions
 	}
+	if omittedByFiles > 0 {
+		warnings = append(warnings, fmt.Sprintf(
+			"review truncated: %d changed file(s) omitted by max_files", omittedByFiles))
+	}
+	if omittedByLines > 0 {
+		warnings = append(warnings, fmt.Sprintf(
+			"review truncated: %d changed file(s) omitted by max_diff_lines", omittedByLines))
+	}
 	sort.Strings(ignored)
 	return files, ignored, summary, warnings
+}
+
+// invalidPathLabel turns an unsafe upstream path into a bounded repository-
+// relative label. The label is diagnostic only and must never be sent to
+// repository tools as a real path.
+func invalidPathLabel(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "<invalid-path/empty>"
+	}
+	escaped := url.PathEscape(truncateRunes(value, 200))
+	escaped = strings.ReplaceAll(escaped, "..", "%2E%2E")
+	switch escaped {
+	case "", ".", "..":
+		escaped = "%2E"
+	}
+	escaped = truncateRunes(escaped, review.MaxPathBytes-len("<invalid-path/>"))
+	return "<invalid-path/" + escaped + ">"
+}
+
+// omittedPathList renders a bounded, safe list of omitted paths for summaries.
+func omittedPathList(omitted []review.OmittedFile, max int) string {
+	if len(omitted) == 0 {
+		return ""
+	}
+	if max <= 0 || max > len(omitted) {
+		max = len(omitted)
+	}
+	shown := make([]string, 0, max)
+	for _, file := range omitted[:max] {
+		shown = append(shown, truncateRunes(file.Path, 120))
+	}
+	out := " [" + strings.Join(shown, ", ")
+	if len(omitted) > max {
+		out += fmt.Sprintf(", ... (+%d more)", len(omitted)-max)
+	}
+	return out + "]"
 }
 
 func validRepoPath(value string) bool {
@@ -1381,37 +1988,41 @@ func (s *ReviewService) Recover(ctx context.Context) error {
 	if err := s.engine.Recover(ctx); err != nil {
 		errs = append(errs, err)
 	}
+statuses:
 	for _, status := range []string{"running", "pending"} {
-		attempted := make(map[string]struct{})
-		for page := 0; page < 20; page++ {
-			workflows, _, err := s.store.ListWorkflows(ctx, store.WorkflowFilter{Kind: "review", Status: status}, "", 50)
+		cursor := ""
+		for {
+			if err := ctx.Err(); err != nil {
+				errs = append(errs, err)
+				break statuses
+			}
+			workflows, next, err := s.store.ListWorkflows(ctx, store.WorkflowFilter{Kind: "review", Status: status}, cursor, 50)
 			if err != nil {
 				errs = append(errs, err)
 				break
 			}
-			var pending []store.Workflow
-			for _, workflow := range workflows {
-				if _, seen := attempted[workflow.ID]; seen {
-					continue
-				}
-				attempted[workflow.ID] = struct{}{}
-				pending = append(pending, workflow)
-			}
-			if len(pending) == 0 {
+			if len(workflows) == 0 {
 				break
 			}
-			for _, workflow := range pending {
+			for _, workflow := range workflows {
+				if err := ctx.Err(); err != nil {
+					errs = append(errs, err)
+					break statuses
+				}
 				if err := s.recoverWorkflow(ctx, workflow); err != nil {
 					errs = append(errs, fmt.Errorf("app: recover workflow %s: %w", workflow.ID, err))
 				}
 			}
-			if len(workflows) < 50 {
+			if next == "" || next == cursor {
 				break
 			}
+			cursor = next
 		}
 	}
-	if err := s.PublishPending(ctx); err != nil {
-		errs = append(errs, err)
+	if ctx.Err() == nil {
+		if err := s.PublishPending(ctx); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	return errors.Join(errs...)
 }
@@ -1431,15 +2042,44 @@ func (s *ReviewService) recoverWorkflow(ctx context.Context, workflow store.Work
 	if err := review.ValidateDossier(&dossier); err != nil {
 		return err
 	}
+	ownershipKey := strings.TrimSpace(record.JobID)
+	if ownershipKey == "" {
+		ownershipKey = workflow.ID
+	}
+	if !s.executors.Acquire(ownershipKey) {
+		s.logger.Info("recovery skipped workflow owned by another handler", "workflow_id", workflow.ID)
+		return nil
+	}
+	defer s.executors.Release(ownershipKey)
 	project, token, err := s.projectToken(ctx, workflow.ProjectID)
 	if err != nil {
 		return err
 	}
 	if _, err := s.currentControl(ctx, project.ID, *workflow.MRIID, record.Generation, dossier.DiffVersion.HeadSHA); err != nil {
 		if IsPermanentJob(err) {
-			return s.engine.Cancel(context.WithoutCancel(ctx), workflow.ID, "superseded")
+			if cancelErr := s.engine.Cancel(context.WithoutCancel(ctx), workflow.ID, "superseded"); cancelErr != nil &&
+				!errors.Is(cancelErr, dag.ErrNotFound) {
+				return cancelErr
+			}
+			return s.skipPublication(ctx, workflow.ID, reviewSupersededReason)
 		}
 		return err
+	}
+	if storedHash := strings.TrimSpace(dossier.Metadata["config_hash"]); storedHash != "" {
+		docs, err := s.repoDocs(ctx, token, project.ID, dossier.MR.TargetBranch)
+		if err != nil {
+			return err
+		}
+		if reviewConfigHash(s.resolveConfig(project, docs)) != storedHash {
+			// The same hash comparison gates Publish; a resumed workflow built
+			// for an older configuration must not run or publish.
+			if err := s.cancelWorkflow(ctx, workflow.ID); err != nil {
+				return err
+			}
+			s.logger.Info("recovery skipped workflow with changed configuration",
+				"workflow_id", workflow.ID, "config_hash", storedHash)
+			return nil
+		}
 	}
 	headDir, cleanup, err := s.recoverRun(ctx, project, token, *workflow.MRIID, record.JobID, workflow.ID, dossier)
 	if err != nil {
@@ -1448,7 +2088,7 @@ func (s *ReviewService) recoverWorkflow(ctx context.Context, workflow store.Work
 	if cleanup != nil {
 		defer cleanup()
 	}
-	profileName, profileCfg := s.profileFor(project, workflow.Profile, "", nil)
+	profileName, profileCfg := s.profileFor(project, workflow.Profile, "", nil, true)
 	profile := review.Profile{Name: profileName, Config: profileCfg}
 	diffs := dossierDiffs(&dossier)
 	index := gitlab.BuildDiffIndex(dossier.DiffVersion, diffs)
@@ -1474,12 +2114,18 @@ func (s *ReviewService) recoverWorkflow(ctx context.Context, workflow store.Work
 	}
 	s.executors.Register(workflow.ID, executor)
 	defer s.executors.Unregister(workflow.ID)
+	noteID := dossierNoteID(dossier)
+	s.reportStatus(ctx, project, token, *workflow.MRIID, record.Generation, dossier.DiffVersion.HeadSHA, reviewStatusUpdate{
+		State:   reviewStatusRunning,
+		HeadSHA: dossier.DiffVersion.HeadSHA,
+	})
 	superseded, err := s.runWithControl(ctx, project.ID, *workflow.MRIID, workflow.ID, record.Generation, dossier.DiffVersion.HeadSHA)
 	if err != nil {
 		return err
 	}
 	if superseded {
-		return nil
+		s.reportSuperseded(ctx, project, token, *workflow.MRIID, record.Generation, dossier.DiffVersion.HeadSHA, workflow.ID)
+		return s.skipPublication(ctx, workflow.ID, reviewSupersededReason)
 	}
 	snapshot, err := s.engine.Snapshot(ctx, workflow.ID)
 	if err != nil {
@@ -1488,11 +2134,46 @@ func (s *ReviewService) recoverWorkflow(ctx context.Context, workflow store.Work
 	cfg := s.resolveConfig(project, dossier.RepoDocs)
 	switch snapshot.Status {
 	case dag.WorkflowCompleted:
-		return s.publish(ctx, workflow.ID)
-	case dag.WorkflowFailed:
-		if cfg.Settings.PostFailureNote {
-			return s.publishFailure(ctx, workflow.ID, snapshot)
+		s.reportStatus(ctx, project, token, *workflow.MRIID, record.Generation, dossier.DiffVersion.HeadSHA, reviewStatusUpdate{
+			State:   reviewStatusPublishing,
+			HeadSHA: dossier.DiffVersion.HeadSHA,
+			NoteID:  noteID,
+		})
+		if err := s.publish(ctx, workflow.ID); err != nil {
+			s.reportPublishFailure(ctx, project, token, *workflow.MRIID, record.Generation, dossier.DiffVersion.HeadSHA, noteID, err)
+			return err
 		}
+		s.reportVerdict(ctx, project, token, *workflow.MRIID, record.Generation, dossier.DiffVersion.HeadSHA, noteID, workflow.ID)
+		return nil
+	case dag.WorkflowFailed:
+		s.reportStatus(ctx, project, token, *workflow.MRIID, record.Generation, dossier.DiffVersion.HeadSHA, reviewStatusUpdate{
+			State:   reviewStatusPublishing,
+			HeadSHA: dossier.DiffVersion.HeadSHA,
+			NoteID:  noteID,
+		})
+		var publishErr error
+		if cfg.Settings.PostFailureNote {
+			publishErr = s.publishFailure(ctx, workflow.ID, snapshot)
+		} else {
+			publishErr = s.skipPublication(ctx, workflow.ID, failureNoteDisabledReason)
+		}
+		s.reportTerminal(ctx, project, token, *workflow.MRIID, record.Generation, dossier.DiffVersion.HeadSHA, reviewStatusUpdate{
+			State:     reviewStatusFailed,
+			HeadSHA:   dossier.DiffVersion.HeadSHA,
+			NoteID:    noteID,
+			Reaction:  reviewAwardFail,
+			ClearEyes: true,
+		})
+		return publishErr
+	case dag.WorkflowCancelled:
+		publishErr := s.skipPublication(ctx, workflow.ID, reviewCancelledReason)
+		s.reportTerminal(ctx, project, token, *workflow.MRIID, record.Generation, dossier.DiffVersion.HeadSHA, reviewStatusUpdate{
+			State:     reviewStatusCancelled,
+			HeadSHA:   dossier.DiffVersion.HeadSHA,
+			NoteID:    noteID,
+			ClearEyes: true,
+		})
+		return publishErr
 	}
 	return nil
 }
@@ -1553,7 +2234,33 @@ func runDirOwned(ws *workspace.Workspace, dir string) bool {
 	return true
 }
 
-// PublishPending retries completed workflows whose publication state is still
+// failureNoteEnabled reads the persisted configuration snapshot for a failed
+// workflow. It avoids publishing a failure note that the project disabled when
+// the process died between the workflow failure and its publication state.
+func (s *ReviewService) failureNoteEnabled(ctx context.Context, workflowID string) (bool, error) {
+	workflow, err := s.store.GetWorkflow(ctx, workflowID)
+	if err != nil {
+		return false, err
+	}
+	record, err := s.store.GetWorkflowDossier(ctx, workflowID)
+	if err != nil {
+		return false, err
+	}
+	var dossier review.Dossier
+	if err := json.Unmarshal(record.Data, &dossier); err != nil {
+		return false, fmt.Errorf("decode dossier: %w", err)
+	}
+	projectRow, err := s.store.GetProject(ctx, workflow.ProjectID)
+	if err != nil {
+		return false, err
+	}
+	if projectRow == nil {
+		return false, fmt.Errorf("project %d is missing", workflow.ProjectID)
+	}
+	return s.resolveConfig(projectRow, dossier.RepoDocs).Settings.PostFailureNote, nil
+}
+
+// PublishPending retries terminal workflows whose publication state is still
 // pending. It is safe to call at startup and after a crash.
 func (s *ReviewService) PublishPending(ctx context.Context) error {
 	if s.publisher == nil {
@@ -1570,7 +2277,29 @@ func (s *ReviewService) PublishPending(ctx context.Context) error {
 		}
 		progress := false
 		for _, item := range pending {
-			if err := s.publisher.Publish(ctx, item.WorkflowID); err != nil {
+			var err error
+			switch item.Status {
+			case string(dag.WorkflowFailed):
+				wantsNote, configErr := s.failureNoteEnabled(ctx, item.WorkflowID)
+				if configErr != nil {
+					errs = append(errs, configErr)
+					continue
+				}
+				if !wantsNote {
+					if skipErr := s.skipPublication(ctx, item.WorkflowID, failureNoteDisabledReason); skipErr != nil {
+						errs = append(errs, skipErr)
+						continue
+					}
+					progress = true
+					continue
+				}
+				err = s.publisher.PublishFailure(ctx, item.WorkflowID, reviewExecutionFailedReason)
+			case string(dag.WorkflowCompleted):
+				err = s.publisher.Publish(ctx, item.WorkflowID)
+			default:
+				continue
+			}
+			if err != nil {
 				if IsPermanentJob(err) {
 					progress = true
 					continue

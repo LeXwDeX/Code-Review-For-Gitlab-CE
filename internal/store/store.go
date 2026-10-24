@@ -12,6 +12,9 @@ var (
 	ErrNotFound  = errors.New("store: not found")
 	ErrConflict  = errors.New("store: conflict")
 	ErrLeaseLost = errors.New("store: lease lost")
+	// ErrIncompleteWorkflow marks a workflow row without its dossier. Retrying
+	// the job cannot repair it, so callers must settle it as permanent.
+	ErrIncompleteWorkflow = errors.New("store: workflow has no dossier")
 )
 
 const (
@@ -28,6 +31,16 @@ const (
 	DeliveryRejected = "rejected"
 )
 
+// Project webhook provisioning states. "unknown" marks a persisted hook that
+// predates state tracking; "failed" carries a sanitized error.
+const (
+	WebhookStateDisabled = "disabled"
+	WebhookStatePending  = "pending"
+	WebhookStateEnabled  = "enabled"
+	WebhookStateFailed   = "failed"
+	WebhookStateUnknown  = "unknown"
+)
+
 // Project matches the projects table. TokenEnc and WebhookSecretEnc only
 // contain ciphertext and are excluded from JSON serialization.
 type Project struct {
@@ -40,6 +53,9 @@ type Project struct {
 	TokenScopes       []string        `json:"token_scopes"`
 	WebhookSecretEnc  []byte          `json:"-"`
 	HookID            *int64          `json:"hook_id,omitempty"`
+	WebhookState      string          `json:"webhook_state"`
+	WebhookEvents     []string        `json:"webhook_events"`
+	WebhookError      string          `json:"webhook_error"`
 	Profile           string          `json:"profile"`
 	Settings          json.RawMessage `json:"settings"`
 	Enabled           bool            `json:"enabled"`
