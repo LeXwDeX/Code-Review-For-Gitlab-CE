@@ -550,6 +550,9 @@ func (e *Engine) runNode(runCtx context.Context, handle *runHandle, wfID, nodeID
 }
 
 func executeSafely(ctx context.Context, exec NodeExecutor, in NodeInput) (out NodeOutput, err error) {
+	if err := ctx.Err(); err != nil {
+		return NodeOutput{}, err
+	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			err = fmt.Errorf("executor panic: %v", recovered)
