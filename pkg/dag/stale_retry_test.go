@@ -442,6 +442,22 @@ func TestStaleRetryCancellationStopsProgress(t *testing.T) {
 	}
 }
 
+func TestExecuteSafelySkipsCancelledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	called := false
+	_, err := executeSafely(ctx, funcExecutor(func(context.Context, NodeInput) (NodeOutput, error) {
+		called = true
+		return NodeOutput{}, nil
+	}), NodeInput{})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("executeSafely error = %v, want context.Canceled", err)
+	}
+	if called {
+		t.Fatal("executor ran with a cancelled context")
+	}
+}
+
 func TestStaleRetryWithoutProgressFailsBounded(t *testing.T) {
 	tests := []struct {
 		name  string
