@@ -1,11 +1,11 @@
-import { useEffect, useId, useMemo, useState } from 'react'
+import { useEffect, useId, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
-  listProfiles, recreateWebhook, rotateProjectToken, unregisterProject, updateProject,
+  listProfiles, recreateWebhook, rotateProjectToken, unregisterProject, updateProject, validateProjectConnection,
 } from '../../api/api'
 import { ApiError, errorMessage } from '../../api/client'
-import type { Project } from '../../api/types'
+import type { Project, ProjectValidation } from '../../api/types'
 import { useCanWrite } from '../../components/RoleContext'
 import {
   Badge, Button, ConfirmDialog, Dialog, ErrorState, Field, LoadingState, Panel, Switch, useToast,
@@ -18,6 +18,18 @@ type SettingsDraft = Record<string, unknown>
 
 function splitComma(value: unknown): string {
   return Array.isArray(value) ? value.join(', ') : ''
+}
+
+const ACCESS_LEVEL_ROLES: Record<number, string> = {
+  10: 'Guest',
+  20: 'Reporter',
+  30: 'Developer',
+  40: 'Maintainer',
+  50: 'Owner',
+}
+
+function accessLevelLabel(level: number): string {
+  return `${ACCESS_LEVEL_ROLES[level] || '未知角色'}（${level}）`
 }
 
 function splitLines(value: unknown): string {
@@ -58,7 +70,10 @@ function BoolSetting({
 }
 
 export function SettingsPanel({ project }: { project: Project }) {
-  const canWrite = useCanWrite()
+  // A project access grant is the only source of project write capability.
+  const canWrite = project.access === 'manage'
+  // Platform-only surfaces stay hidden for ordinary project managers.
+  const isAdmin = useCanWrite()
   const toast = useToast()
   const queryClient = useQueryClient()
   const navigate = useNavigate()
@@ -72,8 +87,11 @@ export function SettingsPanel({ project }: { project: Project }) {
   const [pendingEnabled, setPendingEnabled] = useState(false)
   const [rotateOpen, setRotateOpen] = useState(false)
   const [token, setToken] = useState('')
+  const [rotateValidation, setRotateValidation] = useState<ProjectValidation | null>(null)
+  const [validating, setValidating] = useState(false)
   const [rotating, setRotating] = useState(false)
   const [rotateError, setRotateError] = useState<unknown>(null)
+  const validateRef = useRef(0)
   const [hookOpen, setHookOpen] = useState(false)
   const [hookPending, setHookPending] = useState(false)
   const [hookError, setHookError] = useState<unknown>(null)
@@ -84,7 +102,7 @@ export function SettingsPanel({ project }: { project: Project }) {
   const profiles = useQuery({
     queryKey: ['profiles', 'project-settings'],
     queryFn: () => listProfiles(),
-    enabled: canWrite,
+    enabled: canWrite && isAdmin,
   })
 
   useEffect(() => {
@@ -93,6 +111,13 @@ export function SettingsPanel({ project }: { project: Project }) {
     setJsonText(JSON.stringify(project.settings || {}, null, 2))
     setJsonError(null)
     setSaveError(null)
+    validateRef.current += 1
+    setValidating(false)
+    setRotating(false)
+    setRotateOpen(false)
+    setToken('')
+    setRotateValidation(null)
+    setRotateError(null)
   }, [project.id])
 
   const updateDraft = (key: string, value: unknown) => {
@@ -146,25 +171,85 @@ export function SettingsPanel({ project }: { project: Project }) {
     }
   }
 
+  const openKeyDialog = () => {
+    setRotateError(null)
+    setToken('')
+    setRotateValidation(null)
+    setRotateOpen(true)
+  }
+
+  const closeKeyDialog = () => {
+    if (rotating || validating) return
+    validateRef.current += 1
+    setRotateOpen(false)
+    setToken('')
+    setRotateValidation(null)
+    setRotateError(null)
+  }
+
+  const changeKey = (value: string) => {
+    setToken(value)
+    setRotateValidation(null)
+    setRotateError(null)
+  }
+
+  const validateKey = async () => {
+    if (!canWrite || !isAdmin) return
+    if (!token.trim()) {
+      setRotateError(new Error('请输入新的访问 Key。'))
+      return
+    }
+    const requestId = validateRef.current + 1
+    validateRef.current = requestId
+    setValidating(true)
+    setRotateError(null)
+    setRotateValidation(null)
+    try {
+      const value = await validateProjectConnection({ project: String(project.id), token: token.trim() })
+      if (validateRef.current !== requestId) return
+      if (value.project_id !== project.id) {
+        setRotateError(new Error('校验返回的项目与当前项目不一致，未更新访问 Key。'))
+        return
+      }
+      setRotateValidation(value)
+    } catch (error) {
+      if (validateRef.current !== requestId) return
+      setRotateError(error)
+    } finally {
+      if (validateRef.current === requestId) setValidating(false)
+    }
+  }
+
   const rotate = async () => {
     if (!canWrite) return
     if (!token.trim()) {
-      setRotateError(new Error('请输入新的 Project Access Token。'))
+      setRotateError(new Error('请输入新的访问 Key。'))
       return
     }
+    // Platform admins keep the optional preflight. Project managers rely on
+    // the rotate handler, which validates the credential server-side.
+    if (isAdmin && !rotateValidation) {
+      setRotateError(new Error('请先校验新的访问 Key。'))
+      return
+    }
+    const requestId = validateRef.current + 1
+    validateRef.current = requestId
     setRotating(true)
     setRotateError(null)
     try {
       await rotateProjectToken(project.id, token.trim())
+      if (validateRef.current !== requestId) return
       setToken('')
+      setRotateValidation(null)
       setRotateOpen(false)
-      toast.push('success', '项目 token 已轮换。')
+      toast.push('success', '仅更新平台保存的访问 Key；未在 GitLab 创建或撤销 Token，也不会自动触发评审或初始化。')
       await queryClient.invalidateQueries({ queryKey: ['project', project.id] })
       await queryClient.invalidateQueries({ queryKey: ['projects'] })
     } catch (error) {
+      if (validateRef.current !== requestId) return
       setRotateError(error)
     } finally {
-      setRotating(false)
+      if (validateRef.current === requestId) setRotating(false)
     }
   }
 
@@ -229,7 +314,7 @@ export function SettingsPanel({ project }: { project: Project }) {
             <div><dt>commit status</dt><dd>{project.settings?.commit_status === undefined ? '继承平台默认' : project.settings.commit_status ? '启用' : '禁用'}</dd></div>
             <div><dt>webhook</dt><dd>{project.hook_id ? '本服务创建' : '手动配置'}</dd></div>
           </dl>
-          <div className={styles.notice}>只读账号不能修改项目设置、轮换 token、重建 webhook 或注销项目。</div>
+          <div className={styles.notice}>只读账号不能修改项目设置、更新访问 Key、重建 webhook 或注销项目。</div>
           <details>
             <summary style={{ minHeight: 44, display: 'flex', alignItems: 'center', cursor: 'pointer' }}>查看设置 JSON</summary>
             <pre className="pre" style={jsonStyle}>{JSON.stringify(project.settings || {}, null, 2)}</pre>
@@ -247,11 +332,17 @@ export function SettingsPanel({ project }: { project: Project }) {
           aside={projectsAside(project)}
         >
           <div className="formGrid">
-            <Field label="评审档位" htmlFor={profileId} hint="来自平台配置；此处可改项目默认档位。">
-              <input id={profileId} className="input" list="project-profile-options" value={profile} onChange={(event) => setProfile(event.target.value)} />
-              <datalist id="project-profile-options">
-                {(profiles.data?.profiles || []).map((item) => <option key={item.name} value={item.name} />)}
-              </datalist>
+            <Field
+              label="评审档位"
+              htmlFor={profileId}
+              hint={isAdmin ? '来自平台配置；此处可改项目默认档位。' : '当前项目档位。普通项目管理员不读取全局档位列表；输入值由服务端校验。'}
+            >
+              <input id={profileId} className="input" list={isAdmin ? 'project-profile-options' : undefined} value={profile} onChange={(event) => setProfile(event.target.value)} />
+              {isAdmin ? (
+                <datalist id="project-profile-options">
+                  {(profiles.data?.profiles || []).map((item) => <option key={item.name} value={item.name} />)}
+                </datalist>
+              ) : null}
             </Field>
             <Field label="评审语言" htmlFor="setting-language" hint="留空时继承平台默认。">
               <select id="setting-language" className="select" value={typeof draft.language === 'string' ? draft.language : ''} onChange={(event) => updateDraft('language', event.target.value)}>
@@ -327,7 +418,7 @@ export function SettingsPanel({ project }: { project: Project }) {
           <div className={ui.stack}>
             <span className="small muted">token 过期时间：{project.token_expires_at ? formatDate(project.token_expires_at) : '未提供'}</span>
             <span className="small muted">token scope：<span className="mono">{project.token_scopes?.join(', ') || '不可用'}</span></span>
-            <Button variant="secondary" onClick={() => { setRotateError(null); setToken(''); setRotateOpen(true) }}>轮换 token</Button>
+            <Button variant="secondary" onClick={openKeyDialog}>更新访问 Key</Button>
             <Button variant="secondary" onClick={() => { setHookError(null); setHookOpen(true) }}>重建 webhook</Button>
             <span className="small muted">{project.hook_id ? `当前由本服务创建（hook #${project.hook_id}）` : '当前为手动配置或未提供 hook ID'}</span>
           </div>
@@ -346,19 +437,65 @@ export function SettingsPanel({ project }: { project: Project }) {
 
       <Dialog
         open={rotateOpen}
-        onClose={() => { if (!rotating) { setRotateOpen(false); setToken('') } }}
-        title="轮换 Project Access Token"
-        description="新 token 应具有 api 和 read_repository scope，且属于可访问该项目的 bot 用户。新值不会在界面回显。"
+        onClose={closeKeyDialog}
+        title="更新访问 Key"
+        description={isAdmin
+          ? '输入新的访问 Key，先只读校验它是否属于当前项目。保存只会替换平台存储的 Key，新值不会在界面回显。'
+          : '输入新的访问 Key。保存时由服务端校验它是否属于当前项目；新值不会在界面回显。'}
         footer={(
           <>
-            <Button variant="secondary" onClick={() => { setRotateOpen(false); setToken('') }} disabled={rotating}>取消</Button>
-            <Button variant="primary" onClick={() => { void rotate() }} loading={rotating}>保存新 token</Button>
+            <Button variant="secondary" onClick={closeKeyDialog} disabled={rotating || validating}>取消</Button>
+            {isAdmin ? (
+              <Button variant="secondary" onClick={() => { void validateKey() }} loading={validating} disabled={rotating}>校验连接</Button>
+            ) : null}
+            <Button
+              variant="primary"
+              onClick={() => { void rotate() }}
+              loading={rotating}
+              disabled={isAdmin ? (!rotateValidation || validating) : validating}
+            >
+              保存访问 Key
+            </Button>
           </>
         )}
       >
-        {rotateError ? <ErrorState error={rotateError} title="轮换失败" /> : null}
-        <Field label="新的 Project Access Token" htmlFor="rotate-token">
-          <input id="rotate-token" className="input" type="password" value={token} onChange={(event) => setToken(event.target.value)} autoComplete="new-password" />
+        {rotateError ? <ErrorState error={rotateError} title="校验或保存失败" /> : null}
+        {!isAdmin ? (
+          <div className={styles.notice}>保存时由服务端校验 Key 归属和权限；界面不会显示或保存明文。</div>
+        ) : null}
+        {rotateValidation ? (
+          <>
+            <div className={styles.notice} role="status">
+              <strong>校验通过，尚未保存</strong>
+            </div>
+            <dl className={ui.definitionGrid}>
+              <div><dt>项目</dt><dd className="mono">{rotateValidation.path_with_namespace}</dd></div>
+              <div><dt>当前身份</dt><dd>{rotateValidation.username}</dd></div>
+              <div><dt>项目角色</dt><dd>{accessLevelLabel(rotateValidation.access_level)}</dd></div>
+              <div>
+                <dt>所需 scope</dt>
+                <dd>{rotateValidation.token_scopes.length ? (
+                  <span className={styles.badgeGroup}>
+                    {rotateValidation.token_scopes.map((scope) => <Badge key={scope} tone="neutral">{scope}</Badge>)}
+                  </span>
+                ) : '未提供'}</dd>
+              </div>
+              <div><dt>Key 有效期</dt><dd>{rotateValidation.token_expires_at ? formatDate(rotateValidation.token_expires_at) : '未提供'}</dd></div>
+              <div><dt>仓库 HEAD</dt><dd className="mono">{rotateValidation.git_head}</dd></div>
+            </dl>
+            <div className={styles.notice}>只读校验未更新平台记录，也未在 GitLab 中创建或撤销任何内容；保存时服务端仍会复核凭据。</div>
+          </>
+        ) : null}
+        <Field label="新的访问 Key" htmlFor="rotate-token">
+          <input
+            id="rotate-token"
+            className="input"
+            type="password"
+            value={token}
+            onChange={(event) => changeKey(event.target.value)}
+            autoComplete="new-password"
+            disabled={rotating || validating}
+          />
         </Field>
       </Dialog>
 

@@ -53,6 +53,9 @@ const (
 	WorkflowPublicationPending   = "pending"
 	WorkflowPublicationPublished = "published"
 	WorkflowPublicationSkipped   = "skipped"
+	// WorkflowPublicationFailed is a terminal publication failure. It stays
+	// separate from workflow execution and needs an explicit republish.
+	WorkflowPublicationFailed = "failed"
 )
 
 // WorkflowDossier is the sanitized input snapshot needed to resume or publish
@@ -71,12 +74,17 @@ type WorkflowDossier struct {
 	Hash             string          `json:"hash"`
 	Data             json.RawMessage `json:"data"`
 	PublicationState string          `json:"publication_state"`
-	CreatedAt        time.Time       `json:"created_at"`
-	UpdatedAt        time.Time       `json:"updated_at"`
+	// PublicationError is a bounded, caller-sanitized reason code or generic
+	// text. It must never contain upstream response bodies or credentials.
+	PublicationError string    `json:"publication_error,omitempty"`
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
 }
 
-// PendingPublication is one completed workflow whose dossier has not been
-// published yet. It deliberately omits the dossier body.
+// PendingPublication is one terminal workflow whose dossier has not been
+// published yet. It deliberately omits the dossier body. Status selects the
+// publisher path: completed uses the normal review, failed uses the failure
+// summary.
 type PendingPublication struct {
 	WorkflowID string    `json:"workflow_id"`
 	JobID      string    `json:"job_id,omitempty"`
@@ -84,5 +92,6 @@ type PendingPublication struct {
 	MRIID      int64     `json:"mr_iid"`
 	HeadSHA    string    `json:"head_sha,omitempty"`
 	Generation int64     `json:"generation"`
+	Status     string    `json:"status"`
 	UpdatedAt  time.Time `json:"updated_at"`
 }

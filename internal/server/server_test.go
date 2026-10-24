@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -53,11 +54,13 @@ func (b *lockedBuffer) String() string {
 type stubGitLab struct {
 	mu sync.Mutex
 
-	project    *gitlab.Project
-	projectErr error
-	tokenInfo  *gitlab.TokenInfo
-	hookID     int64
-	calls      []string
+	project     *gitlab.Project
+	projectErr  error
+	tokenInfo   *gitlab.TokenInfo
+	hookID      int64
+	listHookErr error
+	hooks       []gitlab.Hook
+	calls       []string
 }
 
 func (s *stubGitLab) record(call string) {
@@ -118,13 +121,53 @@ func (s *stubGitLab) GetMemberAccess(context.Context, string, int64, int64) (int
 	return 30, nil
 }
 
-func (s *stubGitLab) CreateProjectHook(context.Context, string, int64, gitlab.HookSpec) (int64, error) {
+func (s *stubGitLab) ListProjectHooks(context.Context, string, int64) ([]gitlab.Hook, error) {
+	s.record("ListProjectHooks")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.listHookErr != nil {
+		return nil, s.listHookErr
+	}
+	return append([]gitlab.Hook(nil), s.hooks...), nil
+}
+
+func (s *stubGitLab) CreateProjectHook(_ context.Context, _ string, _ int64, spec gitlab.HookSpec) (int64, error) {
 	s.record("CreateProjectHook")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.hooks = append(s.hooks, gitlab.Hook{
+		ID:                    s.hookID,
+		URL:                   spec.URL,
+		PushEvents:            spec.PushEvents,
+		MergeRequestsEvents:   spec.MergeRequestsEvents,
+		NoteEvents:            spec.NoteEvents,
+		EnableSSLVerification: spec.EnableSSLVerification,
+	})
 	return s.hookID, nil
+}
+
+func (s *stubGitLab) UpdateProjectHook(_ context.Context, _ string, _, hookID int64, spec gitlab.HookSpec) error {
+	s.record("UpdateProjectHook")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.hooks {
+		if s.hooks[i].ID != hookID {
+			continue
+		}
+		s.hooks[i].URL = spec.URL
+		s.hooks[i].PushEvents = spec.PushEvents
+		s.hooks[i].MergeRequestsEvents = spec.MergeRequestsEvents
+		s.hooks[i].NoteEvents = spec.NoteEvents
+		s.hooks[i].EnableSSLVerification = spec.EnableSSLVerification
+		return nil
+	}
+	return &gitlab.Error{Op: "update_hook", Status: 404}
 }
 
 func (s *stubGitLab) DeleteProjectHook(context.Context, string, int64, int64) error {
 	s.record("DeleteProjectHook")
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return nil
 }
 
@@ -145,6 +188,7 @@ func defaultStubGitLab() *stubGitLab {
 			ID:                42,
 			PathWithNamespace: "group/repo",
 			WebURL:            "https://gitlab.example.com/group/repo",
+			HTTPURLToRepo:     "https://gitlab.example.com/group/repo.git",
 			DefaultBranch:     "main",
 		},
 		tokenInfo: &gitlab.TokenInfo{Scopes: []string{"api", "read_repository"}, Active: true},
@@ -191,6 +235,14 @@ func newTestEnv(t *testing.T) *testEnv {
 		Database:   st,
 		Worker:     lifecycle,
 		Logger:     newTestLogger(logs),
+		Auth: AuthConfig{
+			SessionKey:      []byte("0123456789abcdef0123456789abcdef"),
+			SessionTTL:      time.Hour,
+			BootstrapAdmins: []string{"alice"},
+		},
+		Access:   st,
+		Sessions: st,
+		Tokens:   st,
 	})
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
@@ -209,6 +261,29 @@ func newTestEnv(t *testing.T) *testEnv {
 
 func (e *testEnv) close() {
 	e.server.Close()
+}
+
+// sessionCookie returns a signed alice session. It lets tests that predate
+// interactive login exercise business routes with an explicit project grant.
+func (e *testEnv) sessionCookie(userID int64, username string) string {
+	e.t.Helper()
+	id, err := randomToken(32)
+	if err != nil {
+		e.t.Fatalf("randomToken: %v", err)
+	}
+	sum := sha256.Sum256([]byte(id))
+	now := time.Now()
+	if err := e.store.CreateSession(context.Background(), store.Session{
+		IDHash: sum[:], UserID: userID, Username: username, Name: username,
+		Role: roleAdmin, ExpiresAt: now.Add(time.Hour), CreatedAt: now,
+	}, 10); err != nil {
+		e.t.Fatalf("CreateSession: %v", err)
+	}
+	auth, err := newAuthService(AuthConfig{SessionKey: []byte("0123456789abcdef0123456789abcdef")})
+	if err != nil {
+		e.t.Fatalf("newAuthService: %v", err)
+	}
+	return sessionCookieName + "=" + auth.sealSession(id)
 }
 
 func newTestLogger(w io.Writer) *slog.Logger {
@@ -341,6 +416,12 @@ func TestRegisterInspectAndRedact(t *testing.T) {
 	if project["id"] != float64(42) || jobID == "" || webhookSecret == "" {
 		t.Fatalf("response = %v", body)
 	}
+	if project["webhook_state"] != "disabled" {
+		t.Fatalf("registered webhook state = %v", project["webhook_state"])
+	}
+	if events, _ := project["webhook_events"].([]any); len(events) != 0 {
+		t.Fatalf("registered webhook events = %v", project["webhook_events"])
+	}
 	text := string(resp.body)
 	for _, forbidden := range []string{testProjectTok, "token_enc", "webhook_secret_enc"} {
 		if strings.Contains(text, forbidden) {
@@ -373,7 +454,11 @@ func TestRegisterInspectAndRedact(t *testing.T) {
 		t.Fatalf("onboarding job missing: %v", err)
 	}
 
-	get := env.request(http.MethodGet, "/api/v1/projects/42", env.adminToken, nil, nil)
+	cookie := env.sessionCookie(7, "alice")
+	if err := env.store.SetProjectGrant(context.Background(), 42, 7, store.ProjectAccessManage); err != nil {
+		t.Fatalf("SetProjectGrant: %v", err)
+	}
+	get := env.request(http.MethodGet, "/api/v1/projects/42", "", nil, map[string]string{"Cookie": cookie})
 	if get.status != http.StatusOK {
 		t.Fatalf("get status = %d", get.status)
 	}
@@ -383,7 +468,7 @@ func TestRegisterInspectAndRedact(t *testing.T) {
 			t.Errorf("GET leaked %q: %s", forbidden, getText)
 		}
 	}
-	list := env.request(http.MethodGet, "/api/v1/projects", env.adminToken, nil, nil)
+	list := env.request(http.MethodGet, "/api/v1/projects", "", nil, map[string]string{"Cookie": cookie})
 	if list.status != http.StatusOK || strings.Contains(string(list.body), webhookSecret) {
 		t.Fatalf("list = %d %s", list.status, list.body)
 	}
@@ -598,9 +683,15 @@ type panicAdmin struct{}
 func (panicAdmin) Register(context.Context, app.RegisterInput) (*app.Registration, error) {
 	panic("boom")
 }
+func (panicAdmin) Validate(context.Context, app.ValidateProjectInput) (*app.ProjectValidation, error) {
+	return &app.ProjectValidation{}, nil
+}
 func (panicAdmin) List(context.Context) ([]store.Project, error) { return nil, nil }
 func (panicAdmin) ListFiltered(context.Context, app.ProjectListFilter) ([]store.Project, error) {
 	return nil, nil
+}
+func (panicAdmin) ListFilteredPage(context.Context, app.ProjectListFilter, string, int) ([]store.Project, string, error) {
+	return nil, "", nil
 }
 func (panicAdmin) Get(context.Context, int64) (*store.Project, error) {
 	return &store.Project{}, nil
@@ -621,9 +712,15 @@ type stubAdmin struct{}
 func (stubAdmin) Register(context.Context, app.RegisterInput) (*app.Registration, error) {
 	return &app.Registration{}, nil
 }
+func (stubAdmin) Validate(context.Context, app.ValidateProjectInput) (*app.ProjectValidation, error) {
+	return &app.ProjectValidation{}, nil
+}
 func (stubAdmin) List(context.Context) ([]store.Project, error) { return nil, nil }
 func (stubAdmin) ListFiltered(context.Context, app.ProjectListFilter) ([]store.Project, error) {
 	return nil, nil
+}
+func (stubAdmin) ListFilteredPage(context.Context, app.ProjectListFilter, string, int) ([]store.Project, string, error) {
+	return nil, "", nil
 }
 func (stubAdmin) Get(context.Context, int64) (*store.Project, error) {
 	return &store.Project{}, nil

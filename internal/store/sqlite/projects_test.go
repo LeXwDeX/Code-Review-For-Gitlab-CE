@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -89,6 +90,77 @@ func TestUpdateProjectFieldsTokenAndHook(t *testing.T) {
 	}
 	if err := s.UpdateProjectToken(ctx, 999, store.ProjectTokenUpdate{TokenEnc: []byte{1}}); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("missing token update = %v", err)
+	}
+}
+
+func TestProjectWebhookStateDefaultsAndUpdates(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t, newFakeClock())
+	mustProject(t, s, 42)
+
+	saved, err := s.GetProject(ctx, 42)
+	if err != nil {
+		t.Fatalf("GetProject: %v", err)
+	}
+	if saved.WebhookState != store.WebhookStateDisabled || len(saved.WebhookEvents) != 0 ||
+		saved.WebhookError != "" || saved.HookID != nil {
+		t.Fatalf("defaults = %+v", saved)
+	}
+
+	hookID := int64(1234)
+	if err := s.UpdateProjectWebhook(ctx, 42, store.ProjectWebhookUpdate{
+		HookID: &hookID, SecretEnc: []byte{4, 5},
+		State: store.WebhookStateEnabled, Events: []string{"push_events", "note_events"},
+	}); err != nil {
+		t.Fatalf("UpdateProjectWebhook enabled: %v", err)
+	}
+	saved, err = s.GetProject(ctx, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.WebhookState != store.WebhookStateEnabled || saved.HookID == nil || *saved.HookID != hookID ||
+		string(saved.WebhookSecretEnc) != string([]byte{4, 5}) ||
+		len(saved.WebhookEvents) != 2 || saved.WebhookEvents[0] != "push_events" {
+		t.Fatalf("enabled = %+v", saved)
+	}
+
+	// A failure keeps the recorded hook and secret but replaces state/error.
+	if err := s.UpdateProjectWebhook(ctx, 42, store.ProjectWebhookUpdate{
+		State: store.WebhookStateFailed, Error: "GitLab webhook list failed (status 403)",
+	}); err != nil {
+		t.Fatalf("UpdateProjectWebhook failed: %v", err)
+	}
+	saved, err = s.GetProject(ctx, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.WebhookState != store.WebhookStateFailed ||
+		saved.WebhookError != "GitLab webhook list failed (status 403)" ||
+		saved.HookID == nil || *saved.HookID != hookID ||
+		string(saved.WebhookSecretEnc) != string([]byte{4, 5}) ||
+		len(saved.WebhookEvents) != 0 {
+		t.Fatalf("failed = %+v", saved)
+	}
+
+	long := strings.Repeat("x", 600)
+	if err := s.UpdateProjectWebhook(ctx, 42, store.ProjectWebhookUpdate{
+		State: store.WebhookStateFailed, Error: long,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	saved, err = s.GetProject(ctx, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(saved.WebhookError) != 512 {
+		t.Fatalf("error length = %d", len(saved.WebhookError))
+	}
+
+	if err := s.UpdateProjectWebhook(ctx, 42, store.ProjectWebhookUpdate{State: "bogus"}); err == nil {
+		t.Fatal("invalid state was accepted")
+	}
+	if err := s.UpdateProjectWebhook(ctx, 999, store.ProjectWebhookUpdate{State: store.WebhookStateDisabled}); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("missing project = %v", err)
 	}
 }
 
@@ -232,6 +304,68 @@ func TestDeleteProjectRemovesOnlyProjectJobs(t *testing.T) {
 	}
 	if got := rowCount(t, s, `SELECT COUNT(*) FROM workflows WHERE project_id = 42`); got != 0 {
 		t.Errorf("project 42 workflows remain")
+	}
+}
+
+func TestListProjectsFilteredPage(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t, newFakeClock())
+	for _, id := range []int64{42, 43, 44} {
+		mustProject(t, s, id)
+	}
+	if _, err := s.UpdateProject(ctx, 43, store.ProjectUpdate{Enabled: ptrBool(false)}); err != nil {
+		t.Fatalf("disable project: %v", err)
+	}
+
+	first, cursor, err := s.ListProjectsFilteredPage(ctx, store.ProjectFilter{Query: "project-4"}, "", 1)
+	if err != nil || len(first) != 1 || first[0].ID != 42 || cursor == "" {
+		t.Fatalf("first page = %+v, %q, %v", first, cursor, err)
+	}
+	second, cursor, err := s.ListProjectsFilteredPage(ctx, store.ProjectFilter{Query: "project-4"}, cursor, 1)
+	if err != nil || len(second) != 1 || second[0].ID != 43 || cursor == "" {
+		t.Fatalf("second page = %+v, %q, %v", second, cursor, err)
+	}
+	third, cursor, err := s.ListProjectsFilteredPage(ctx, store.ProjectFilter{Query: "project-4"}, cursor, 1)
+	if err != nil || len(third) != 1 || third[0].ID != 44 || cursor != "" {
+		t.Fatalf("third page = %+v, %q, %v", third, cursor, err)
+	}
+
+	disabled, cursor, err := s.ListProjectsFilteredPage(ctx,
+		store.ProjectFilter{Enabled: ptrBool(false)}, "", 1)
+	if err != nil || len(disabled) != 1 || disabled[0].ID != 43 || cursor != "" {
+		t.Fatalf("disabled page = %+v, %q, %v", disabled, cursor, err)
+	}
+
+	if _, _, err := s.ListProjectsFilteredPage(ctx, store.ProjectFilter{}, "not-a-cursor", 1); !errors.Is(err, store.ErrInvalidCursor) {
+		t.Fatalf("invalid cursor = %v", err)
+	}
+
+	_, queryCursor, err := s.ListProjectsFilteredPage(ctx, store.ProjectFilter{Query: "project-4"}, "", 1)
+	if err != nil || queryCursor == "" {
+		t.Fatalf("query cursor = %q, %v", queryCursor, err)
+	}
+	if _, _, err := s.ListProjectsFilteredPage(ctx, store.ProjectFilter{Query: "project-43"}, queryCursor, 1); !errors.Is(err, store.ErrInvalidCursor) {
+		t.Fatalf("changed query cursor = %v", err)
+	}
+	_, unfilteredCursor, err := s.ListProjectsFilteredPage(ctx, store.ProjectFilter{}, "", 1)
+	if err != nil || unfilteredCursor == "" {
+		t.Fatalf("unfiltered cursor = %q, %v", unfilteredCursor, err)
+	}
+	if _, _, err := s.ListProjectsFilteredPage(ctx, store.ProjectFilter{Enabled: ptrBool(false)}, unfilteredCursor, 1); !errors.Is(err, store.ErrInvalidCursor) {
+		t.Fatalf("changed enabled cursor = %v", err)
+	}
+
+	// A deleted row does not invalidate a keyset cursor.
+	head, cursor, err := s.ListProjectsFilteredPage(ctx, store.ProjectFilter{}, "", 1)
+	if err != nil || len(head) != 1 || head[0].ID != 42 {
+		t.Fatalf("head page = %+v, %q, %v", head, cursor, err)
+	}
+	if err := s.DeleteProject(ctx, 42); err != nil {
+		t.Fatalf("DeleteProject: %v", err)
+	}
+	afterDelete, _, err := s.ListProjectsFilteredPage(ctx, store.ProjectFilter{}, cursor, 1)
+	if err != nil || len(afterDelete) != 1 || afterDelete[0].ID != 43 {
+		t.Fatalf("page after delete = %+v, %v", afterDelete, err)
 	}
 }
 
